@@ -6,16 +6,39 @@ from llama_cpp._internals import LlamaModel, LlamaContext
 from .pools import PoolConfig
 
 class SluiceEngine:
-    def __init__(self, model_path: str, pools: List[PoolConfig]):
+    def __init__(self, model_path: str, pools: List[PoolConfig], 
+                 mmproj_path: Optional[str] = None,
+                 tensor_split: Optional[List[float]] = None,
+                 n_batch: int = 512,
+                 n_ubatch: int = 256):
         print(f"[SLUICE] Initializing Multi-Pool Engine: {model_path}")
         self.model_path = model_path
+        self.n_batch = n_batch
+        self.n_ubatch = n_ubatch
         
-        # 1. Load Model Weights once
+        # 1. Load Model Weights
         mparams = llama_cpp.llama_model_default_params()
         mparams.n_gpu_layers = -1
+        mparams.split_mode = llama_cpp.LLAMA_SPLIT_MODE_LAYER
+        
+        if tensor_split:
+            # Convert list of floats to ctypes array
+            n_devices = len(tensor_split)
+            ts_array = (llama_cpp.ctypes.c_float * n_devices)(*tensor_split)
+            mparams.tensor_split = ts_array
+            print(f"[ENGINE] Applied explicit tensor split: {tensor_split}")
+
         self.model = LlamaModel(path_model=model_path, params=mparams, verbose=False)
         
-        # 2. Create Contexts for each Pool
+        # 2. Load Vision Projector if provided
+        if mmproj_path:
+            if os.path.exists(mmproj_path):
+                print(f"[ENGINE] Vision projector support detected: {mmproj_path}")
+                self.mmproj_path = mmproj_path
+            else:
+                print(f"[WARNING] mmproj file not found at {mmproj_path}")
+
+        # 3. Create Contexts for each Pool
         self.contexts: Dict[str, LlamaContext] = {}
         for config in pools:
             self.contexts[config.name] = self._create_context(config)
@@ -24,6 +47,8 @@ class SluiceEngine:
     def _create_context(self, config: PoolConfig):
         cparams = llama_cpp.llama_context_default_params()
         cparams.n_ctx = config.max_tokens
+        cparams.n_batch = self.n_batch
+        cparams.n_ubatch = self.n_ubatch
         cparams.type_k = config.type_k
         cparams.type_v = config.type_v
         cparams.flash_attn = True

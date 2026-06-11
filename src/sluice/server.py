@@ -20,6 +20,11 @@ from .middleware.trimmer import MiddleOutTrimmer
 
 # Configuration from Environment
 MODEL_PATH = os.getenv("SLUICE_MODEL_PATH", "/models/gguf/model.gguf")
+MMPROJ_PATH = os.getenv("SLUICE_MMPROJ_PATH")
+TENSOR_SPLIT = os.getenv("SLUICE_TENSOR_SPLIT")
+BATCH_SIZE = int(os.getenv("SLUICE_BATCH_SIZE", "512"))
+UBATCH_SIZE = int(os.getenv("SLUICE_UBATCH_SIZE", "256"))
+
 RESERVED_POOL = int(os.getenv("SLUICE_RESERVED_POOL", "32768"))
 LARGE_THRESHOLD = int(os.getenv("SLUICE_LARGE_THRESHOLD", "16384"))
 SCAVENGE_HOOK = os.getenv("SLUICE_SCAVENGE_HOOK")
@@ -56,7 +61,7 @@ METRIC_TOKENS_TOTAL = Counter("sluice_tokens_total", "Tokens", ["model"])
 METRIC_POOL_USED = Gauge("sluice_pool_used", "Used tokens", ["pool"])
 METRIC_POOL_TOTAL = Gauge("sluice_pool_total", "Total tokens", ["pool"])
 METRIC_CACHE_HITS = Counter("sluice_prefix_cache_hits", "Cache hits")
-METRIC_FRAG_RATIO = Gauge("sluice_vram_frag_ratio", "Current KV cache fragmentation ratio")
+METRIC_FRAG_RATIO = Gauge("sluice_frag_ratio", "Frag ratio", ["pool"])
 
 # --- Radix Cache ---
 
@@ -148,7 +153,24 @@ async def startup():
         print(f"[ERROR] Model not found at {MODEL_PATH}")
         return
 
-    ENGINE = SluiceEngine(MODEL_PATH, POOLS)
+    # Parse tensor split
+    ts_list = None
+    if TENSOR_SPLIT:
+        try:
+            ts_list = [float(x.strip()) for x in TENSOR_SPLIT.split(",")]
+        except Exception as e:
+            print(f"[WARNING] Failed to parse SLUICE_TENSOR_SPLIT: {e}")
+
+    # Initialize Engine with hardware tuning
+    ENGINE = SluiceEngine(
+        model_path=MODEL_PATH, 
+        pools=POOLS,
+        mmproj_path=MMPROJ_PATH,
+        tensor_split=ts_list,
+        n_batch=BATCH_SIZE,
+        n_ubatch=UBATCH_SIZE
+    )
+
     capacities = {p.name: p.max_tokens for p in POOLS}
     BANK = TokenBank(list(capacities.keys()), capacities, RESERVED_POOL, LARGE_THRESHOLD, SCAVENGE_HOOK, RECOVERY_HOOK)
     TRIMMER = MiddleOutTrimmer(get_tokens_func=get_tokens, format_prompt_func=format_prompt)
@@ -170,11 +192,6 @@ async def admin_resume():
     return {"status": "running"}
 
 @app.post("/v1/admin/defrag", dependencies=[Depends(verify_auth)])
-async def admin_defrag(pool_name: str):
-    ENGINE.defrag(pool_name)
-    return {"status": "defrag_scheduled"}
-
-@app.post("/v1/admin/resize", dependencies=[Depends(verify_auth)])
 async def admin_resize(pool_name: str, new_size: int = Body(..., embed=True)):
     config = next((p for p in POOLS if p.name == pool_name), POOLS[0])
     new_config = config.copy(update={"max_tokens": new_size})
@@ -198,7 +215,6 @@ async def admin_self_test():
         loop = asyncio.get_event_loop()
         for t in tests:
             t0 = time.time()
-            # Fixed args: pool, sid, tokens, max_tokens, hit, grammar, budget
             text, _, _, _ = await loop.run_in_executor(None, low_level_generate, pool_name, sid, get_tokens(t["prompt"]), 32, None, None, 0)
             passed = bool(re.search(t["expected_regex"], text, re.IGNORECASE))
             results.append({"name": t["name"], "passed": passed, "latency_ms": (time.time()-t0)*1000})
@@ -215,9 +231,6 @@ def get_tokens(prompt: str) -> List[int]:
     tokens = (llama_cpp.llama_token * (len(p_bytes) + 1))()
     n = llama_cpp.llama_tokenize(m_ptr, p_bytes, len(p_bytes), tokens, len(tokens), True, True)
     return [tokens[i] for i in range(n)]
-
-def middle_out_trim(messages: List[ChatMessage], target_tokens: int, tools: Optional[List[Dict[str, Any]]] = None) -> List[ChatMessage]:
-    return TRIMMER.trim(messages, target_tokens, tools)
 
 def format_prompt(messages: List[ChatMessage], tools: Optional[List[Dict[str, Any]]] = None) -> str:
     t_str = ENGINE.get_chat_template()
@@ -255,7 +268,7 @@ def low_level_generate(pool: str, sid: int, tokens: List[int], max_tokens: int, 
             ntid = llama_cpp.llama_sample_token_greedy(c_ptr, ctypes.byref(candidates_p))
             if grammar: llama_cpp.llama_grammar_accept_token(c_ptr, grammar, ntid)
             if ntid == llama_cpp.llama_token_eos(m_ptr): break
-            buf = ctypes.create_string_buffer(128) 
+            buf = ctypes.create_string_buffer(128)
             nb = llama_cpp.llama_token_to_piece(m_ptr, ntid, buf, 128, 0, False)
             output.append(buf[:nb].decode('utf-8', errors='ignore'))
             batch.n_tokens, batch.token[0], batch.pos[0], batch.logits[0] = 1, ntid, n_cur, True
@@ -295,7 +308,7 @@ def low_level_stream_generator(pool: str, sid: int, tokens: List[int], max_token
             batch.n_tokens, batch.token[0], batch.pos[0], batch.logits[0] = 1, ntid, n_cur, True
             if llama_cpp.llama_decode(c_ptr, batch) != 0: break
             n_cur += 1
-        yield f"data: {json.dumps({'id': rid, 'object': 'chat.completion.chunk', 'created': int(time.time()), 'model': model, 'choices': [{'index': 0, 'delta': {}, 'finish_reason': finish_reason}]})}\n\n"
+        yield f"data: {json.dumps({'id': rid, 'object': 'chat.completion.chunk', 'choices': [{'index': 0, 'delta': {}, 'finish_reason': finish_reason}]})}\n\n"
         yield "data: [DONE]\n\n"
     finally: llama_cpp.llama_batch_free(batch)
 
@@ -373,6 +386,7 @@ async def embeddings(request: EmbeddingRequest):
         data, total_p = [], 0
         async with execution_mutex:
             for idx, text in enumerate(inputs):
+                tokens = get_tokens(text)
                 def proc(s, tks):
                     c_ptr = ENGINE.get_context_ptr(pool_name)
                     batch = llama_cpp.llama_batch_init(len(tks), 0, 1)
@@ -384,7 +398,7 @@ async def embeddings(request: EmbeddingRequest):
                     finally:
                         llama_cpp.llama_batch_free(batch)
                         ENGINE.remove_sequence(pool_name, s)
-                vec, n = await asyncio.get_event_loop().run_in_executor(None, proc, sid, get_tokens(text))
+                vec, n = await asyncio.get_event_loop().run_in_executor(None, proc, sid, tokens)
                 data.append({"object": "embedding", "index": idx, "embedding": vec})
                 total_p += n
         return EmbeddingResponse(model=request.model, data=data, usage={"prompt_tokens": total_p, "total_tokens": total_p})
