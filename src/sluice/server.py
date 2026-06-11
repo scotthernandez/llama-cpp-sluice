@@ -40,11 +40,9 @@ async def elasticity_loop():
         async with BANK.condition:
             if BANK.used == 0 and BANK.waiting_large == 0:
                 print("[ELASTICITY] System idle. Shrinking context back to base...")
-                # 1. Run recovery hook (Start SST/TTS)
                 if RECOVERY_HOOK:
                     await BANK._run_hook(RECOVERY_HOOK, "Recovery")
                 
-                # 2. Hot-swap back to base size
                 ENGINE.hot_swap_context(BASE_POOL)
                 await BANK.update_total(BASE_POOL, expanded=False)
 
@@ -59,7 +57,6 @@ class ChatCompletionRequest(BaseModel):
     messages: List[ChatMessage]
     max_tokens: Optional[int] = 128
     temperature: float = 0.0
-    # Sluice Extension
     required_ctx: Optional[int] = None
 
 class ChatCompletionResponse(BaseModel):
@@ -95,12 +92,6 @@ async def admin_resume():
     await BANK.resume()
     return {"status": "running"}
 
-@app.post("/v1/admin/defrag")
-async def admin_defrag():
-    """Forces internal KV cache compaction."""
-    ENGINE.defrag()
-    return {"status": "defrag_scheduled"}
-
 @app.post("/v1/admin/resize")
 async def admin_resize(new_size: int = Body(..., embed=True)):
     """Gracefully drains, hot-swaps context size, and resumes."""
@@ -113,11 +104,11 @@ async def admin_resize(new_size: int = Body(..., embed=True)):
 # --- Inference Core ---
 
 def format_prompt(messages: List[ChatMessage]) -> str:
-    """Simple chat-to-prompt conversion (Agnostic)."""
+    """Simple chat-to-prompt conversion."""
     return "\n".join([f"{m.role}: {m.content}" for m in messages]) + "\nassistant: "
 
 def low_level_generate(sid: int, prompt: str, max_tokens: int):
-    """Executes inference using the shared engine for a specific sequence ID."""
+    """Executes inference using the shared engine."""
     model_ptr = ENGINE.get_model_ptr()
     ctx_ptr = ENGINE.get_context_ptr()
     
@@ -177,7 +168,7 @@ def low_level_generate(sid: int, prompt: str, max_tokens: int):
 @app.post("/v1/ctx/{ctx_size}/chat/completions", response_model=ChatCompletionResponse)
 async def chat_completions(
     request: ChatCompletionRequest,
-    ctx_size: Optional[int] = Path(None),
+    ctx_size: Optional[int] = None,
     x_sluice_required_ctx: Optional[int] = Header(None)
 ):
     final_ctx = ctx_size or x_sluice_required_ctx or request.required_ctx or 2048
@@ -185,13 +176,11 @@ async def chat_completions(
     try:
         sid = await BANK.acquire(final_ctx)
     except TimeoutError as e:
-        # If auto-elasticity is on, we try one last hot-swap attempt 
-        # (The Scavenge hook was already triggered by acquire() level 3)
         if AUTO_ELASTICITY and not BANK.is_expanded:
-            print(f"[ELASTICITY] Timeout hit. Attempting emergency expansion to {final_ctx}...")
+            print(f"[ELASTICITY] Attempting emergency expansion to {final_ctx}...")
             ENGINE.hot_swap_context(final_ctx)
             await BANK.update_total(final_ctx, expanded=True)
-            sid = await BANK.acquire(final_ctx, timeout=10.0) # Short retry
+            sid = await BANK.acquire(final_ctx, timeout=10.0)
         else:
             raise HTTPException(status_code=503, detail=str(e))
 
@@ -205,13 +194,14 @@ async def chat_completions(
             created=int(time.time()),
             model=request.model,
             choices=[{
+                "index": 0,
                 "message": {"role": "assistant", "content": text},
                 "finish_reason": "stop"
             }],
             usage={"prompt_tokens": n_prompt, "completion_tokens": n_gen, "total_tokens": n_prompt + n_gen}
         )
     finally:
-        llama_cpp.llama_kv_cache_seq_rm(ENGINE.get_context_ptr(), sid, -1, -1)
+        llama_cpp.llama_memory_seq_rm(ENGINE.get_memory(), sid, -1, -1)
         await BANK.release(sid)
 
 if __name__ == "__main__":

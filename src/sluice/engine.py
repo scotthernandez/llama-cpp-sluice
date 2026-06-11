@@ -28,10 +28,9 @@ class SluiceEngine:
         self.context = self._create_context(new_size)
         self.total_tokens = new_size
 
-    def defrag(self):
-        """Triggers internal KV cache compaction."""
-        print("[ENGINE] Triggering KV cache defragmentation...")
-        llama_cpp.llama_kv_cache_defrag(self.context.ctx)
+    def get_memory(self):
+        """Returns the memory object for advanced cache manipulation."""
+        return llama_cpp.llama_get_memory(self.context.ctx)
 
     def get_context_ptr(self):
         return self.context.ctx

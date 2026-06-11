@@ -12,6 +12,7 @@
 - **Asymmetric Contexts:** Serve 2k, 32k, and 96k requests simultaneously from the same pool without VRAM duplication.
 - **Anti-Starvation Bank:** A custom `TokenBank` with barrier logic ensures that large coding tasks are never starved by a flood of smaller chat requests.
 - **Proxmox & Docker Native:** Includes first-class support for LXC GPU passthrough and CUDA-accelerated containers.
+- **Dynamic Auto-Elasticity:** Automatically grows the VRAM pool by scavenging resources (stopping SST/TTS) when a large request arrives, and shrinks back once idle.
 
 ## 🛠️ Quick Start
 
@@ -21,11 +22,18 @@ pip install .
 ```
 
 ### 2. Environment Setup
-Set your model path and pool sizes:
+Basic tuning:
 ```bash
 export SLUICE_MODEL_PATH="/path/to/model.gguf"
-export SLUICE_TOTAL_POOL=98304
+export SLUICE_BASE_POOL=98304
 export SLUICE_RESERVED_POOL=32768
+```
+
+Advanced Elasticity (VRAM Scavenging):
+```bash
+export SLUICE_AUTO_ELASTICITY=true
+export SLUICE_SCAVENGE_HOOK="/path/to/scavenge.sh"
+export SLUICE_RECOVERY_HOOK="/path/to/recovery.sh"
 ```
 
 ### 3. Run the Server

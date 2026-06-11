@@ -1,6 +1,5 @@
 import asyncio
 import time
-import subprocess
 from typing import Dict, Optional
 
 class TokenBank:
@@ -69,7 +68,11 @@ class TokenBank:
                             self.waiting_large -= 1
                         raise TimeoutError(f"Token bank timeout after {elapsed:.1f}s: Needed {requested_size}")
                     
-                    await self.condition.wait_for(lambda: True, timeout=1.0)
+                    # Manual timeout loop since asyncio.Condition.wait() has no timeout
+                    try:
+                        await asyncio.wait_for(self.condition.wait(), timeout=1.0)
+                    except asyncio.TimeoutError:
+                        continue
             except Exception:
                 if is_large and 'can_fit' in locals() and can_fit is False:
                     self.waiting_large -= 1
@@ -81,21 +84,24 @@ class TokenBank:
             self.used -= size
             
             # Check for Recovery (Level 4): If pool is idle and expanded, shrink back.
-            if self.is_expanded and self.used == 0 and self.waiting_large == 0:
-                print("[BANK] Pool idle and expanded. Triggering recovery...")
-                asyncio.create_task(self._trigger_recovery())
-                
+            # (Logic moved to server.py elasticity_loop, but bank provides the state)
             self.condition.notify_all()
 
-    async def _trigger_recovery(self):
-        """Internal recovery sequence."""
-        if not self.recovery_hook:
-            return
-        
-        # 1. We stay expanded until the ENGINE actually resizes, 
-        # but we notify the server to start the shrink process.
-        # This will be handled by the server.py coordinator.
-        pass
+    async def drain(self):
+        """Enable draining mode: reject new, wait for old to finish."""
+        async with self.condition:
+            self.is_draining = True
+            print("[BANK] Draining mode enabled. Waiting for active sequences to complete...")
+            while self.used > 0:
+                await self.condition.wait()
+            print("[BANK] Drain complete.")
+
+    async def resume(self):
+        """Disable draining mode."""
+        async with self.condition:
+            self.is_draining = False
+            print("[BANK] Resumed from drain.")
+            self.condition.notify_all()
 
     async def update_total(self, new_total: int, expanded: bool):
         """Dynamically update pool size (e.g. after resizing context)."""
@@ -119,39 +125,3 @@ class TokenBank:
                 print(f"[BANK] {label} hook failed: {stderr.decode()}")
         except Exception as e:
             print(f"[BANK] Error running {label} hook: {e}")
-
-    async def drain(self):
-        """Enable draining mode: reject new, wait for old to finish."""
-        async with self.condition:
-            self.is_draining = True
-            print("[BANK] Draining mode enabled. Waiting for active sequences to complete...")
-            while self.used > 0:
-                await self.condition.wait()
-            print("[BANK] Drain complete.")
-
-    async def resume(self):
-        """Disable draining mode."""
-        async with self.condition:
-            self.is_draining = False
-            print("[BANK] Resumed from drain.")
-
-    async def update_total(self, new_total: int):
-        """Dynamically update pool size (e.g. after resizing context)."""
-        async with self.condition:
-            self.total = new_total
-            self.condition.notify_all()
-
-    async def _run_scavenge_hook(self):
-        try:
-            proc = await asyncio.create_subprocess_shell(
-                self.starvation_hook,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
-            )
-            stdout, stderr = await proc.communicate()
-            if proc.returncode == 0:
-                print("[BANK] Scavenge hook success.")
-            else:
-                print(f"[BANK] Scavenge hook failed: {stderr.decode()}")
-        except Exception as e:
-            print(f"[BANK] Error running scavenge hook: {e}")
