@@ -4,6 +4,9 @@
 
 `llama-cpp-sluice` is a high-performance wrapper for `llama-cpp-python` designed for multi-GPU home-lab environments with asymmetric PCIe bottlenecks. It implements the **Shared-Weight Asymmetric Multi-Context (SWAMC)** architecture.
 
+### 💻 Hardware Agnostic
+While optimized for multi-GPU setups (PCIe x16/x4), Sluice is **fully compatible with single-GPU and CPU-only (OpenBLAS/AVX) systems**. Any environment supported by `llama.cpp` will benefit from its dynamic VRAM management and anti-starvation logic.
+
 ## 🤖 Disclosure
 **This project is 100% AI-generated under the light supervision of Scott Hernandez.** It is a personal-use tool created to solve specific hardware constraints in multi-GPU PCIe bottleneck environments.
 
@@ -42,7 +45,7 @@ python -m sluice.server
 ```
 
 ## 📐 Architecture
-See the [Documentation](./docs/architecture.md) for a deep dive into the SWAMC pattern and the [Priority Lanes](./docs/priority-lanes.md) guide for details on the Anti-Starvation logic.
+See the [Documentation](./docs/architecture.md) for a deep dive into the SWAMC pattern, the [Priority Lanes](./docs/priority-lanes.md) guide for details on the Anti-Starvation logic, and the [Concurrency Guide](./docs/concurrency.md) for technical details on locking.
 
 ## 📜 License
 Distributed under the MIT License. See `LICENSE` for more information.
