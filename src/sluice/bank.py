@@ -4,11 +4,14 @@ import subprocess
 from typing import Dict, Optional
 
 class TokenBank:
-    def __init__(self, total_tokens: int, reserved_for_large: int, large_threshold: int = 16384, starvation_hook: Optional[str] = None):
+    def __init__(self, total_tokens: int, reserved_for_large: int, large_threshold: int = 16384, 
+                 starvation_hook: Optional[str] = None, recovery_hook: Optional[str] = None):
+        self.base_total = total_tokens
         self.total = total_tokens
         self.reserved_for_large = reserved_for_large
         self.large_threshold = large_threshold
         self.starvation_hook = starvation_hook
+        self.recovery_hook = recovery_hook
         
         self.used = 0
         self.active_seqs: Dict[int, int] = {}
@@ -17,6 +20,7 @@ class TokenBank:
         self.condition = asyncio.Condition(self.lock)
         self.waiting_large = 0
         self.is_draining = False
+        self.is_expanded = False
 
     async def acquire(self, requested_size: int, timeout: float = 60.0) -> int:
         """
@@ -53,11 +57,11 @@ class TokenBank:
                         self.active_seqs[sid] = requested_size
                         return sid
 
-                    # Check for Starvation Hook (Level 3 Escalation)
+                    # Level 3: Starvation Escalation
                     elapsed = time.time() - start_time
                     if is_large and self.starvation_hook and elapsed > 15.0 and not hook_triggered:
                         print(f"[BANK] LARGE STARVATION DETECTED ({elapsed:.1f}s). Triggering scavenge hook...")
-                        asyncio.create_task(self._run_scavenge_hook())
+                        asyncio.create_task(self._run_hook(self.starvation_hook, "Scavenge"))
                         hook_triggered = True
 
                     if elapsed > timeout:
@@ -65,7 +69,7 @@ class TokenBank:
                             self.waiting_large -= 1
                         raise TimeoutError(f"Token bank timeout after {elapsed:.1f}s: Needed {requested_size}")
                     
-                    await self.condition.wait_for(lambda: True, timeout=1.0) # Periodically check time
+                    await self.condition.wait_for(lambda: True, timeout=1.0)
             except Exception:
                 if is_large and 'can_fit' in locals() and can_fit is False:
                     self.waiting_large -= 1
@@ -75,7 +79,46 @@ class TokenBank:
         async with self.condition:
             size = self.active_seqs.pop(sid, 0)
             self.used -= size
+            
+            # Check for Recovery (Level 4): If pool is idle and expanded, shrink back.
+            if self.is_expanded and self.used == 0 and self.waiting_large == 0:
+                print("[BANK] Pool idle and expanded. Triggering recovery...")
+                asyncio.create_task(self._trigger_recovery())
+                
             self.condition.notify_all()
+
+    async def _trigger_recovery(self):
+        """Internal recovery sequence."""
+        if not self.recovery_hook:
+            return
+        
+        # 1. We stay expanded until the ENGINE actually resizes, 
+        # but we notify the server to start the shrink process.
+        # This will be handled by the server.py coordinator.
+        pass
+
+    async def update_total(self, new_total: int, expanded: bool):
+        """Dynamically update pool size (e.g. after resizing context)."""
+        async with self.condition:
+            self.total = new_total
+            self.is_expanded = expanded
+            self.condition.notify_all()
+
+    async def _run_hook(self, hook: str, label: str):
+        try:
+            print(f"[BANK] Executing {label} hook: {hook}")
+            proc = await asyncio.create_subprocess_shell(
+                hook,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout, stderr = await proc.communicate()
+            if proc.returncode == 0:
+                print(f"[BANK] {label} hook success.")
+            else:
+                print(f"[BANK] {label} hook failed: {stderr.decode()}")
+        except Exception as e:
+            print(f"[BANK] Error running {label} hook: {e}")
 
     async def drain(self):
         """Enable draining mode: reject new, wait for old to finish."""
