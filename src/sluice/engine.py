@@ -12,12 +12,27 @@ class SluiceEngine:
         mparams.n_gpu_layers = -1  # Max offload
         self.model = LlamaModel(path_model=model_path, params=mparams, verbose=False)
         
-        # 2. Create the Master Context (The Pool)
-        cparams = llama_cpp.llama_context_default_params()
-        cparams.n_ctx = total_tokens
-        cparams.flash_attn = True
-        self.context = LlamaContext(model=self.model, params=cparams, verbose=False)
+        # 2. Create Initial Master Context
+        self.context = self._create_context(total_tokens)
         
+    def _create_context(self, n_ctx: int):
+        cparams = llama_cpp.llama_context_default_params()
+        cparams.n_ctx = n_ctx
+        cparams.flash_attn = True
+        return LlamaContext(model=self.model, params=cparams, verbose=False)
+
+    def hot_swap_context(self, new_size: int):
+        """Recreates the context with a new size without dropping weights."""
+        print(f"[ENGINE] Hot-swapping context: {self.total_tokens} -> {new_size}")
+        # Managed LlamaContext handles llama_free automatically on destruction
+        self.context = self._create_context(new_size)
+        self.total_tokens = new_size
+
+    def defrag(self):
+        """Triggers internal KV cache compaction."""
+        print("[ENGINE] Triggering KV cache defragmentation...")
+        llama_cpp.llama_kv_cache_defrag(self.context.ctx)
+
     def get_context_ptr(self):
         return self.context.ctx
 
