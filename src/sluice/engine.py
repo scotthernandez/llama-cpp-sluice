@@ -10,27 +10,31 @@ class SluiceEngine:
                  mmproj_path: Optional[str] = None,
                  tensor_split: Optional[List[float]] = None,
                  n_batch: int = 512,
-                 n_ubatch: int = 256):
+                 n_ubatch: int = 256,
+                 n_gpu_layers: int = -1,
+                 split_mode: int = llama_cpp.LLAMA_SPLIT_MODE_LAYER,
+                 flash_attn: bool = True,
+                 embeddings: bool = True):
         print(f"[SLUICE] Initializing Multi-Pool Engine: {model_path}")
         self.model_path = model_path
         self.n_batch = n_batch
         self.n_ubatch = n_ubatch
+        self.flash_attn = flash_attn
+        self.embeddings = embeddings
         
         # 1. Load Model Weights
         mparams = llama_cpp.llama_model_default_params()
-        mparams.n_gpu_layers = -1
-        mparams.split_mode = llama_cpp.LLAMA_SPLIT_MODE_LAYER
+        mparams.n_gpu_layers = n_gpu_layers
+        mparams.split_mode = split_mode
         
         if tensor_split:
-            # Convert list of floats to ctypes array
-            n_devices = len(tensor_split)
-            ts_array = (llama_cpp.ctypes.c_float * n_devices)(*tensor_split)
+            ts_array = (llama_cpp.ctypes.c_float * len(tensor_split))(*tensor_split)
             mparams.tensor_split = ts_array
             print(f"[ENGINE] Applied explicit tensor split: {tensor_split}")
 
         self.model = LlamaModel(path_model=model_path, params=mparams, verbose=False)
         
-        # 2. Load Vision Projector if provided
+        # 2. Vision Projector
         if mmproj_path:
             if os.path.exists(mmproj_path):
                 print(f"[ENGINE] Vision projector support detected: {mmproj_path}")
@@ -38,7 +42,7 @@ class SluiceEngine:
             else:
                 print(f"[WARNING] mmproj file not found at {mmproj_path}")
 
-        # 3. Create Contexts for each Pool
+        # 3. Create Contexts
         self.contexts: Dict[str, LlamaContext] = {}
         for config in pools:
             self.contexts[config.name] = self._create_context(config)
@@ -51,17 +55,14 @@ class SluiceEngine:
         cparams.n_ubatch = self.n_ubatch
         cparams.type_k = config.type_k
         cparams.type_v = config.type_v
-        cparams.flash_attn = True
-        cparams.embeddings = True
+        cparams.flash_attn = self.flash_attn
+        cparams.embeddings = self.embeddings
         return LlamaContext(model=self.model, params=cparams, verbose=False)
 
     def hot_swap_context(self, pool_name: str, new_config: PoolConfig):
-        """Recreates a specific context without dropping weights."""
-        print(f"[ENGINE] Hot-swapping pool '{pool_name}'...")
         self.contexts[pool_name] = self._create_context(new_config)
 
     def defrag(self, pool_name: str):
-        """Triggers internal KV cache compaction for a specific pool."""
         llama_cpp.llama_kv_cache_defrag(self.contexts[pool_name].ctx)
 
     def get_frag_ratio(self, pool_name: str) -> float:

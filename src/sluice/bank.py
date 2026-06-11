@@ -8,8 +8,11 @@ class BankSaturated(Exception):
     pass
 
 class TokenBank:
-    def __init__(self, pool_names: List[str], pool_capacities: Dict[str, int], reserved_for_large: int, large_threshold: int = 16384, 
-                 starvation_hook: Optional[str] = None, recovery_hook: Optional[str] = None):
+    def __init__(self, pool_names: List[str], pool_capacities: Dict[str, int], reserved_for_large: int, 
+                 large_threshold: int = 16384, 
+                 starvation_hook: Optional[str] = None, 
+                 recovery_hook: Optional[str] = None,
+                 scavenge_delay: float = 15.0):
         self.pool_names = pool_names
         self.capacities = pool_capacities
         self.used = {name: 0 for name in pool_names}
@@ -17,8 +20,9 @@ class TokenBank:
         self.large_threshold = large_threshold
         self.starvation_hook = starvation_hook
         self.recovery_hook = recovery_hook
+        self.scavenge_delay = scavenge_delay
         
-        self.active_seqs: Dict[int, Dict[str, Any]] = {} # sid -> {pool, size}
+        self.active_seqs: Dict[int, Dict[str, Any]] = {} 
         self.pinned_seqs: Dict[int, Dict[str, Any]] = {} 
         self.seq_counter = 0
         self.lock = asyncio.Lock()
@@ -54,7 +58,7 @@ class TokenBank:
                         return sid
 
                     elapsed = time.time() - start_time
-                    if is_large and self.starvation_hook and elapsed > 15.0 and not hook_triggered:
+                    if is_large and self.starvation_hook and elapsed > self.scavenge_delay and not hook_triggered:
                         asyncio.create_task(self._run_hook(self.starvation_hook, "Scavenge"))
                         hook_triggered = True
 
