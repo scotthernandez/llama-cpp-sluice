@@ -69,6 +69,7 @@ HOST = os.getenv("SLUICE_HOST", "0.0.0.0")
 POOLS_JSON = os.getenv("SLUICE_POOLS")
 if POOLS_JSON: POOLS = [PoolConfig(**p) for p in json.loads(POOLS_JSON)]
 else: POOLS = DEFAULT_POOLS
+BASE_POOL = POOLS[0].max_tokens 
 
 app = FastAPI(title="Llama-CPP Sluice: Fully Configurable Asymmetric Server")
 security = HTTPBearer(auto_error=False)
@@ -392,10 +393,10 @@ def low_level_stream_start(pool: str, sid: int, tokens: List[int], hit: Optional
 
 def low_level_stream_step(pool: str, sid: int, n_cur: int, last_tokens: List[int], request: ChatCompletionRequest, grammar: Optional[Any], budget: int):
     m_ptr, c_ptr = ENGINE.get_model_ptr(), ENGINE.get_context_ptr(pool)
-    if budget > 0 and (n_cur + 1) >= budget: return None, "length"
+    if budget > 0 and (n_cur + 1) >= budget: return None, 0, "length"
     
     ntid = apply_sampling(c_ptr, m_ptr, last_tokens, request, grammar)
-    if ntid == llama_cpp.llama_token_eos(m_ptr): return None, "stop"
+    if ntid == llama_cpp.llama_token_eos(m_ptr): return None, ntid, "stop"
     
     buf = ctypes.create_string_buffer(128)
     nb = llama_cpp.llama_token_to_piece(m_ptr, ntid, buf, 128, 0, False)
@@ -405,10 +406,10 @@ def low_level_stream_step(pool: str, sid: int, n_cur: int, last_tokens: List[int
     try:
         batch.n_tokens = 1
         batch.token[0], batch.pos[0], batch.n_seq_id[0], batch.seq_id[0][0], batch.logits[0] = ntid, n_cur, 1, sid, True
-        if llama_cpp.llama_decode(c_ptr, batch) != 0: return None, "error"
+        if llama_cpp.llama_decode(c_ptr, batch) != 0: return None, ntid, "error"
     finally: llama_cpp.llama_batch_free(batch)
     
-    return piece, None
+    return piece, ntid, None
 
 # --- Routes ---
 
@@ -471,16 +472,15 @@ async def chat_completions(request: ChatCompletionRequest, ctx_size: Optional[in
                 
                 for _ in range(request.max_tokens or DEFAULT_MAX_TOKENS):
                     async with execution_mutex:
-                        piece, finish = await loop.run_in_executor(None, low_level_stream_step, pool.name, sid, n_cur, last_tokens, request, grammar, allocation_size)
+                        # Task 1/Fix: Return ntid and append to last_tokens
+                        piece, ntid, finish = await loop.run_in_executor(None, low_level_stream_step, pool.name, sid, n_cur, last_tokens, request, grammar, allocation_size)
                     
                     if finish:
                         yield f"data: {json.dumps({'id': rid, 'object': 'chat.completion.chunk', 'choices': [{'index': 0, 'delta': {}, 'finish_reason': finish}]})}\n\n"
                         break
                     
                     output_text += piece
-                    # No easy way to get token ID here without another lookup, so we approximate or use piece.
-                    # For sampling penalties, using approx tokens is okay for now.
-                    # But actually we should return ntid from stream_step.
+                    last_tokens.append(ntid)
                     
                     yield f"data: {json.dumps({'id': rid, 'object': 'chat.completion.chunk', 'choices': [{'index': 0, 'delta': {'content': piece}, 'finish_reason': None}]})}\n\n"
                     

@@ -39,8 +39,8 @@ def test_openai_streaming_format():
          patch("sluice.server.low_level_stream_step") as mock_step, \
          patch("sluice.server.get_tokens", return_value=[1,2,3]):
         
-        # (piece, finish_reason)
-        mock_step.side_effect = [("Hi", None), (None, "stop")]
+        # Now returns 3 values: (piece, ntid, finish_reason)
+        mock_step.side_effect = [("Hi", 100, None), (None, 0, "stop")]
         
         response = client.post("/v1/chat/completions", json={
             "messages": [{"role": "user", "content": "hi"}],
