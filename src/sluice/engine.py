@@ -19,6 +19,7 @@ class SluiceEngine:
         cparams = llama_cpp.llama_context_default_params()
         cparams.n_ctx = n_ctx
         cparams.flash_attn = True
+        cparams.embeddings = True # Enable embeddings
         return LlamaContext(model=self.model, params=cparams, verbose=False)
 
     def hot_swap_context(self, new_size: int):
@@ -37,3 +38,32 @@ class SluiceEngine:
 
     def get_model_ptr(self):
         return self.model.model
+
+    def clone_sequence(self, src_sid: int, dest_sid: int, length: int):
+        """Zero-copy clone of KV cache tokens from one sequence to another."""
+        llama_cpp.llama_memory_seq_cp(self.context.ctx, src_sid, dest_sid, 0, length)
+
+    def remove_sequence(self, sid: int):
+        """Removes a specific sequence from the KV cache."""
+        llama_cpp.llama_memory_seq_rm(self.context.ctx, sid, -1, -1)
+
+    def get_train_n_ctx(self) -> int:
+        """Returns the native training context limit of the model."""
+        return llama_cpp.llama_n_ctx_train(self.model.model)
+
+    def get_chat_template(self) -> Optional[str]:
+        """Returns the Jinja2 chat template from model metadata if available."""
+        return self.model.metadata().get("tokenizer.chat_template")
+
+    def get_n_embd(self) -> int:
+        """Returns the embedding dimension size."""
+        return llama_cpp.llama_n_embd(self.model.model)
+
+    def get_embeddings(self, sid: int) -> List[float]:
+        """Retrieves embeddings for a processed sequence."""
+        embd_ptr = llama_cpp.llama_get_embeddings_seq(self.context.ctx, sid)
+        if not embd_ptr:
+            raise RuntimeError(f"Failed to retrieve embeddings for sequence {sid}")
+        
+        n_embd = self.get_n_embd()
+        return [float(embd_ptr[i]) for i in range(n_embd)]
