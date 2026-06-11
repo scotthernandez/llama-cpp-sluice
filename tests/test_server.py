@@ -1,4 +1,5 @@
 import pytest
+import asyncio
 from fastapi.testclient import TestClient
 from unittest.mock import MagicMock, patch
 import os
@@ -26,6 +27,9 @@ def reset_bank():
     BANK.is_expanded = False
     BANK.waiting_large = 0
     BANK.active_seqs = {}
+    BANK.total = 98304 # Default
+    BANK.reserved_for_large = 32768
+    BANK.large_threshold = 16384
 
 @pytest.fixture(autouse=True)
 def mock_llama_cpp_rm():
@@ -73,9 +77,31 @@ def test_admin_drain_resume():
 @pytest.mark.asyncio
 async def test_admin_resize():
     with patch("sluice.server.ENGINE.hot_swap_context") as mock_swap:
-        # Note: server.py expects BASE_POOL to be defined.
-        # We use Body(..., embed=True) for resize.
         response = client.post("/v1/admin/resize", json={"new_size": 4096})
         assert response.status_code == 200
         assert response.json()["new_size"] == 4096
         mock_swap.assert_called_with(4096)
+
+@pytest.mark.asyncio
+async def test_elasticity_emergency_expansion():
+    with patch("sluice.server.AUTO_ELASTICITY", True), \
+         patch("sluice.server.ENGINE.hot_swap_context") as mock_swap, \
+         patch("sluice.server.low_level_generate") as mock_gen:
+        
+        mock_gen.return_value = ("Expanded", 1, 1)
+        
+        # Force a timeout on first acquire to trigger expansion
+        BANK.total = 10
+        BANK.reserved_for_large = 5
+        BANK.large_threshold = 20
+        
+        # Use a mock to make the first acquire call fail fast
+        with patch.object(BANK, 'acquire', side_effect=[asyncio.TimeoutError("first fail"), 123]):
+            response = client.post("/v1/ctx/20/chat/completions", json={
+                "messages": [{"role": "user", "content": "test"}]
+            })
+        
+        assert response.status_code == 200
+        assert BANK.is_expanded is True
+        assert BANK.total == 20
+        mock_swap.assert_called_with(20)

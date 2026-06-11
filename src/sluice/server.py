@@ -19,6 +19,7 @@ LARGE_THRESHOLD = int(os.getenv("SLUICE_LARGE_THRESHOLD", "16384"))
 SCAVENGE_HOOK = os.getenv("SLUICE_SCAVENGE_HOOK")
 RECOVERY_HOOK = os.getenv("SLUICE_RECOVERY_HOOK")
 AUTO_ELASTICITY = os.getenv("SLUICE_AUTO_ELASTICITY", "false").lower() == "true"
+ELASTICITY_INTERVAL = float(os.getenv("SLUICE_ELASTICITY_INTERVAL", "5.0"))
 PORT = int(os.getenv("SLUICE_PORT", "8001"))
 
 app = FastAPI(title="Llama-CPP Sluice: Dynamic Asymmetric Inference Server")
@@ -32,7 +33,7 @@ BANK: TokenBank = TokenBank(BASE_POOL, RESERVED_POOL, LARGE_THRESHOLD, SCAVENGE_
 async def elasticity_loop():
     """Background task to manage pool shrinking and recovery."""
     while True:
-        await asyncio.sleep(5)
+        await asyncio.sleep(ELASTICITY_INTERVAL)
         if not AUTO_ELASTICITY or not BANK.is_expanded:
             continue
             
