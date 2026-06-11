@@ -1,51 +1,58 @@
 import sys
-from unittest.mock import MagicMock, AsyncMock
+from unittest.mock import MagicMock, patch
 import os
 
-# 1. Mock llama_cpp and its internals BEFORE any imports
+# 1. Mock llama_cpp and its internals
 mock_llama = MagicMock()
 mock_internals = MagicMock()
-
-# Set successful defaults
-mock_llama.llama_decode.return_value = 0
-mock_llama.llama_batch_init.return_value = MagicMock()
-mock_llama.llama_tokenize.return_value = 5
-
 sys.modules['llama_cpp'] = mock_llama
 sys.modules['llama_cpp._internals'] = mock_internals
 
 # 2. Setup mock model/context classes
-mock_internals.LlamaModel.return_value = MagicMock()
-mock_internals.LlamaContext.return_value = MagicMock()
+mock_model_obj = MagicMock()
+mock_ctx_obj = MagicMock()
+mock_internals.LlamaModel.return_value = mock_model_obj
+mock_internals.LlamaContext.return_value = mock_ctx_obj
 
-# 3. Import Sluice modules and inject mock dependencies
+# 3. Import Sluice modules
 import sluice.bank
 import sluice.engine
 import sluice.server
+from sluice.pools import PoolConfig
 
-# 4. Initialize globals to avoid NoneType errors in tests
+# 4. Initialize globals for server tests
 sluice.server.ENGINE = MagicMock()
-sluice.server.ENGINE.get_train_n_ctx.return_value = 32768
+sluice.server.ENGINE.get_model_ptr.return_value = MagicMock()
+sluice.server.ENGINE.get_context_ptr.return_value = MagicMock()
 sluice.server.ENGINE.get_chat_template.return_value = None
+sluice.server.ENGINE.get_train_n_ctx.return_value = 32768
 sluice.server.ENGINE.get_n_embd.return_value = 128
 sluice.server.ENGINE.get_embeddings.return_value = [0.1] * 128
+sluice.server.ENGINE.get_frag_ratio.return_value = 0.0
 
-# Use a real TokenBank but mock the hooks
-sluice.server.BANK = sluice.bank.TokenBank(98304, 32768)
+# Provide pools that actually work with the barrier
+TEST_POOLS = [
+    PoolConfig(name="precision", max_tokens=100000, precision_threshold=8192),
+    PoolConfig(name="efficiency", max_tokens=100000, precision_threshold=0)
+]
+sluice.server.POOLS = TEST_POOLS
+sluice.server.BASE_POOL = TEST_POOLS[0].max_tokens
+sluice.server.LARGE_THRESHOLD = 16384
+sluice.server.RESERVED_POOL = 1000 # Small reserve for tests
 
-# 5. Provide fixtures
+capacities = {p.name: p.max_tokens for p in TEST_POOLS}
+sluice.server.BANK = sluice.bank.TokenBank(list(capacities.keys()), capacities, 1000)
+
 import pytest
 
 @pytest.fixture(autouse=True)
-def mock_llama_cpp_fixture():
-    return mock_llama
-
-@pytest.fixture(autouse=True)
-def clean_bank():
-    sluice.server.BANK.used = 0
-    sluice.server.BANK.active_seqs = {}
-    sluice.server.BANK.pinned_seqs = {}
-    sluice.server.BANK.waiting_large = 0
-    sluice.server.BANK.is_draining = False
-    sluice.server.BANK.is_expanded = False
-    sluice.server.BANK.total = 98304
+def clean_bank_fixture():
+    bank = sluice.server.BANK
+    bank.used = {name: 0 for name in bank.pool_names}
+    bank.active_seqs = {}
+    bank.pinned_seqs = {}
+    bank.waiting_large = 0
+    bank.is_draining = False
+    bank.is_expanded = False
+    bank.capacities = {"precision": 100000, "efficiency": 100000}
+    yield bank

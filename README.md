@@ -13,6 +13,7 @@ While optimized for multi-GPU setups (PCIe x16/x4), Sluice is **fully compatible
 ## 🚀 Key Features
 - **Shared Weight Pooling:** Load model weights into VRAM exactly once; share them across an infinite number of virtual context windows.
 - **Asymmetric Contexts:** Serve 2k, 32k, and 96k requests simultaneously from the same pool without VRAM duplication.
+- **Adaptive Context Negotiation:** Decoupled middleware that transparently trims conversation history (middle-out) to fit VRAM budget, protecting agent stability.
 - **Radix Prefix Caching:** Automatically deduplicate VRAM for shared system prompts or large context blocks using zero-copy cloning.
 - **Native Chat Templates:** Automatically detects and uses the model's native Jinja2 chat template from GGUF metadata for perfect prompt fidelity.
 - **Embeddings Support:** High-performance `/v1/embeddings` endpoint sharing the same model weights.

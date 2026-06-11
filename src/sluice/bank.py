@@ -1,7 +1,11 @@
 import asyncio
 import time
 import subprocess
-from typing import Dict, Optional, List
+from typing import Dict, Optional, List, Any
+
+class BankSaturated(Exception):
+    """Raised when a request cannot be satisfied within the timeout."""
+    pass
 
 class TokenBank:
     def __init__(self, pool_names: List[str], pool_capacities: Dict[str, int], reserved_for_large: int, large_threshold: int = 16384, 
@@ -30,10 +34,6 @@ class TokenBank:
 
         async with self.condition:
             if self.is_draining: raise RuntimeError("Server is currently draining.")
-            
-            # Fast-path check: If even a trimmed version won't fit the reserved floor, 
-            # we should signal a backoff immediately.
-            
             if is_large: self.waiting_large += 1
             
             try:
@@ -60,8 +60,7 @@ class TokenBank:
 
                     if elapsed > timeout:
                         if is_large: self.waiting_large -= 1
-                        # Raise a specific error that the server can map to 429
-                        raise ResourceWarning(f"Bank saturated: Needed {requested_size} in {pool_name}")
+                        raise BankSaturated(f"Bank saturated: Needed {requested_size} in {pool_name}")
                     
                     try: await asyncio.wait_for(self.condition.wait(), timeout=min(1.0, timeout - elapsed))
                     except asyncio.TimeoutError: continue
@@ -70,11 +69,9 @@ class TokenBank:
                 raise
 
     def get_available_for_large(self, pool_name: str) -> int:
-        """Returns the absolute maximum tokens available for a Large request in a pool."""
         return self.capacities[pool_name] - self.used[pool_name]
 
     def get_available_for_small(self, pool_name: str) -> int:
-        """Returns the available tokens for Small requests, respecting the reservoir barrier."""
         available = self.capacities[pool_name] - self.used[pool_name]
         return max(0, available - self.reserved_for_large)
 

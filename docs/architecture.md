@@ -25,3 +25,9 @@ By using `split_mode: layer`, inter-GPU communication is minimized to token acti
 
 ### Native Template Fidelity
 Sluice extracts the `tokenizer.chat_template` directly from GGUF metadata. This ensures that the model (Qwen, Llama, Gemma, etc.) always sees the exact prompt format it was optimized for, reducing hallucinations and instruction-following errors.
+
+### Adaptive Context Negotiation (Middleware)
+Sluice features a decoupled middleware module (`sluice.middleware.trimmer`) that handles **Context Negotiation** transparently.
+- **Zero-Latency State Access:** Living within the same process, the trimmer has microsecond access to the `TokenBank` state.
+- **Middle-Out Trimming:** When VRAM is low, it prunes the oldest middle history while locking the System Prompt and Recent Context.
+- **Resilience:** Protects autonomous agents from API crashes by reshaping workloads to fit available hardware resources without requiring client-side changes.
