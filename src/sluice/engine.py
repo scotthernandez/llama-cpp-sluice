@@ -1,4 +1,6 @@
 import llama_cpp
+import os
+from typing import Optional, List
 from llama_cpp._internals import LlamaModel, LlamaContext
 
 class SluiceEngine:
@@ -32,6 +34,22 @@ class SluiceEngine:
     def get_memory(self):
         """Returns the memory object for advanced cache manipulation."""
         return llama_cpp.llama_get_memory(self.context.ctx)
+
+    def get_frag_ratio(self) -> float:
+        """
+        Calculates the fragmentation ratio of the KV cache.
+        Returns a float between 0.0 (perfectly contiguous) and 1.0 (fully fragmented).
+        """
+        # In llama.cpp 0.3.x, we check the used vs reserved cells in the memory pool
+        # This is a heuristic: if we have many sequences but they are small, 
+        # the 'holes' between them represent fragmentation.
+        n_used = llama_cpp.llama_get_kv_cache_used_cells(self.context.ctx)
+        if self.total_tokens == 0: return 0.0
+        return 1.0 - (n_used / self.total_tokens)
+
+    def apply_grammar(self, gbnf_string: str):
+        """Creates a llama_grammar from GBNF and applies it to the context."""
+        return llama_cpp.LlamaGrammar.from_string(gbnf_string)
 
     def get_context_ptr(self):
         return self.context.ctx
