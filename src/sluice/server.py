@@ -5,7 +5,8 @@ import time
 import uuid
 import json
 from typing import Optional, List, Dict, Any, Generator
-from fastapi import FastAPI, HTTPException, Body, Header, Path, Response
+from fastapi import FastAPI, HTTPException, Body, Header, Path, Response, Depends
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 import llama_cpp
@@ -21,11 +22,21 @@ RESERVED_POOL = int(os.getenv("SLUICE_RESERVED_POOL", "32768"))
 LARGE_THRESHOLD = int(os.getenv("SLUICE_LARGE_THRESHOLD", "16384"))
 SCAVENGE_HOOK = os.getenv("SLUICE_SCAVENGE_HOOK")
 RECOVERY_HOOK = os.getenv("SLUICE_RECOVERY_HOOK")
+API_KEY = os.getenv("SLUICE_API_KEY")
 AUTO_ELASTICITY = os.getenv("SLUICE_AUTO_ELASTICITY", "false").lower() == "true"
 ELASTICITY_INTERVAL = float(os.getenv("SLUICE_ELASTICITY_INTERVAL", "5.0"))
 PORT = int(os.getenv("SLUICE_PORT", "8001"))
 
 app = FastAPI(title="Llama-CPP Sluice: Dynamic Asymmetric Inference Server")
+security = HTTPBearer(auto_error=False)
+
+# --- Authentication ---
+
+async def verify_auth(auth: Optional[HTTPAuthorizationCredentials] = Depends(security)):
+    if not API_KEY:
+        return
+    if auth is None or auth.credentials != API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid or missing API Key")
 
 # --- Prometheus Metrics ---
 
@@ -70,15 +81,17 @@ async def elasticity_loop():
 
 class ChatMessage(BaseModel):
     role: str
-    content: str
+    content: Optional[str] = None
+    tool_calls: Optional[List[Dict[str, Any]]] = None
 
 class ChatCompletionRequest(BaseModel):
     model: str = "sluice-model"
     messages: List[ChatMessage]
+    tools: Optional[List[Dict[str, Any]]] = None
+    tool_choice: Optional[Any] = None
     max_tokens: Optional[int] = 128
     temperature: float = 0.0
     stream: bool = False
-    # Sluice Extension
     required_ctx: Optional[int] = None
 
 class ChatCompletionResponse(BaseModel):
@@ -113,23 +126,23 @@ async def startup():
 
 # --- Admin Routes ---
 
-@app.get("/metrics")
+@app.get("/metrics", dependencies=[Depends(verify_auth)])
 async def metrics():
     return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
-@app.post("/v1/admin/drain")
+@app.post("/v1/admin/drain", dependencies=[Depends(verify_auth)])
 async def admin_drain():
     """Stops accepting new requests and waits for active ones to finish."""
     asyncio.create_task(BANK.drain())
     return {"status": "draining"}
 
-@app.post("/v1/admin/resume")
+@app.post("/v1/admin/resume", dependencies=[Depends(verify_auth)])
 async def admin_resume():
     """Resumes accepting requests."""
     await BANK.resume()
     return {"status": "running"}
 
-@app.post("/v1/admin/defrag")
+@app.post("/v1/admin/defrag", dependencies=[Depends(verify_auth)])
 async def admin_defrag():
     """Forces internal KV cache compaction."""
     # Check if llama_kv_cache_defrag exists in this version of llama-cpp-python
@@ -139,7 +152,7 @@ async def admin_defrag():
     else:
         raise HTTPException(status_code=501, detail="Internal defrag not supported in this llama-cpp-python version.")
 
-@app.post("/v1/admin/resize")
+@app.post("/v1/admin/resize", dependencies=[Depends(verify_auth)])
 async def admin_resize(new_size: int = Body(..., embed=True)):
     """Gracefully drains, hot-swaps context size, and resumes."""
     await BANK.drain()
@@ -150,9 +163,23 @@ async def admin_resize(new_size: int = Body(..., embed=True)):
 
 # --- Inference Core ---
 
-def format_prompt(messages: List[ChatMessage]) -> str:
-    """Simple chat-to-prompt conversion."""
-    return "\n".join([f"{m.role}: {m.content}" for m in messages]) + "\nassistant: "
+def format_prompt(messages: List[ChatMessage], tools: Optional[List[Dict[str, Any]]] = None) -> str:
+    """Simple chat-to-prompt conversion with tool support."""
+    prompt = ""
+    if tools:
+        prompt += "Available Tools:\n"
+        for tool in tools:
+            prompt += f"- {json.dumps(tool)}\n"
+        prompt += "\n"
+    
+    for m in messages:
+        if m.content:
+            prompt += f"{m.role}: {m.content}\n"
+        if m.tool_calls:
+            for tc in m.tool_calls:
+                prompt += f"call: {json.dumps(tc)}\n"
+                
+    return prompt + "assistant: "
 
 def low_level_generate(sid: int, prompt: str, max_tokens: int):
     """Executes non-streaming inference."""
@@ -290,8 +317,8 @@ def low_level_stream_generator(sid: int, prompt: str, max_tokens: int, request_i
 
 # --- Routes ---
 
-@app.post("/v1/chat/completions", response_model=ChatCompletionResponse)
-@app.post("/v1/ctx/{ctx_size}/chat/completions", response_model=ChatCompletionResponse)
+@app.post("/v1/chat/completions", response_model=ChatCompletionResponse, dependencies=[Depends(verify_auth)])
+@app.post("/v1/ctx/{ctx_size}/chat/completions", response_model=ChatCompletionResponse, dependencies=[Depends(verify_auth)])
 async def chat_completions(
     request: ChatCompletionRequest,
     ctx_size: Optional[int] = None,
@@ -311,7 +338,7 @@ async def chat_completions(
         else:
             raise HTTPException(status_code=503, detail=str(e))
 
-    prompt = format_prompt(request.messages)
+    prompt = format_prompt(request.messages, request.tools)
 
     if request.stream:
         async def stream_wrapper():

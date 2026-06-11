@@ -16,6 +16,8 @@ While optimized for multi-GPU setups (PCIe x16/x4), Sluice is **fully compatible
 - **Anti-Starvation Bank:** A custom `TokenBank` with barrier logic ensures that large coding tasks are never starved by a flood of smaller chat requests.
 - **Proxmox & Docker Native:** Includes first-class support for LXC GPU passthrough and CUDA-accelerated containers.
 - **Dynamic Auto-Elasticity:** Automatically grows the VRAM pool by scavenging resources (stopping SST/TTS) when a large request arrives, and shrinks back once idle.
+- **Tool Calling Support:** Full support for OpenAI-standard `tools` and `tool_choice` parameters.
+- **Optional Authentication:** Secure your server with a simple `SLUICE_API_KEY` Bearer Token.
 
 ## 🛠️ Quick Start
 
@@ -30,6 +32,7 @@ Basic tuning:
 export SLUICE_MODEL_PATH="/path/to/model.gguf"
 export SLUICE_BASE_POOL=98304
 export SLUICE_RESERVED_POOL=32768
+export SLUICE_API_KEY="your-secret-key"
 ```
 
 Advanced Elasticity (VRAM Scavenging):
