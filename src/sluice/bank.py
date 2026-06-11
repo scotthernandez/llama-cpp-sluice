@@ -30,6 +30,10 @@ class TokenBank:
 
         async with self.condition:
             if self.is_draining: raise RuntimeError("Server is currently draining.")
+            
+            # Fast-path check: If even a trimmed version won't fit the reserved floor, 
+            # we should signal a backoff immediately.
+            
             if is_large: self.waiting_large += 1
             
             try:
@@ -56,13 +60,23 @@ class TokenBank:
 
                     if elapsed > timeout:
                         if is_large: self.waiting_large -= 1
-                        raise TimeoutError(f"Bank timeout: Needed {requested_size} in {pool_name}")
+                        # Raise a specific error that the server can map to 429
+                        raise ResourceWarning(f"Bank saturated: Needed {requested_size} in {pool_name}")
                     
                     try: await asyncio.wait_for(self.condition.wait(), timeout=min(1.0, timeout - elapsed))
                     except asyncio.TimeoutError: continue
             except Exception:
                 if is_large and 'can_fit' in locals() and can_fit is False: self.waiting_large -= 1
                 raise
+
+    def get_available_for_large(self, pool_name: str) -> int:
+        """Returns the absolute maximum tokens available for a Large request in a pool."""
+        return self.capacities[pool_name] - self.used[pool_name]
+
+    def get_available_for_small(self, pool_name: str) -> int:
+        """Returns the available tokens for Small requests, respecting the reservoir barrier."""
+        available = self.capacities[pool_name] - self.used[pool_name]
+        return max(0, available - self.reserved_for_large)
 
     async def release(self, sid: int, pin: bool = False):
         async with self.condition:
