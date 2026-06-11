@@ -1,6 +1,7 @@
 import llama_cpp
 import os
 import json
+import ctypes
 from typing import Optional, List, Dict
 from llama_cpp._internals import LlamaModel, LlamaContext
 from .pools import PoolConfig
@@ -12,20 +13,28 @@ class SluiceEngine:
                  n_batch: int = 512,
                  n_ubatch: int = 256,
                  n_gpu_layers: int = -1,
-                 split_mode: int = llama_cpp.LLAMA_SPLIT_MODE_LAYER,
+                 split_mode: int = 2, # LLAMA_SPLIT_MODE_LAYER
                  flash_attn: bool = True,
-                 embeddings: bool = True):
+                 embeddings: bool = True,
+                 n_threads: Optional[int] = None,
+                 n_threads_batch: Optional[int] = None,
+                 use_mlock: bool = False,
+                 use_mmap: bool = True):
         print(f"[SLUICE] Initializing Multi-Pool Engine: {model_path}")
         self.model_path = model_path
         self.n_batch = n_batch
         self.n_ubatch = n_ubatch
         self.flash_attn = flash_attn
         self.embeddings = embeddings
+        self.n_threads = n_threads or os.cpu_count() or 4
+        self.n_threads_batch = n_threads_batch or os.cpu_count() or 4
         
         # 1. Load Model Weights
         mparams = llama_cpp.llama_model_default_params()
         mparams.n_gpu_layers = n_gpu_layers
         mparams.split_mode = split_mode
+        mparams.use_mlock = use_mlock
+        mparams.use_mmap = use_mmap
         
         if tensor_split:
             ts_array = (llama_cpp.ctypes.c_float * len(tensor_split))(*tensor_split)
@@ -53,6 +62,8 @@ class SluiceEngine:
         cparams.n_ctx = config.max_tokens
         cparams.n_batch = self.n_batch
         cparams.n_ubatch = self.n_ubatch
+        cparams.n_threads = self.n_threads
+        cparams.n_threads_batch = self.n_threads_batch
         cparams.type_k = config.type_k
         cparams.type_v = config.type_v
         cparams.flash_attn = self.flash_attn

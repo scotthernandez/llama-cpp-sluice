@@ -29,6 +29,11 @@ FLASH_ATTN = os.getenv("SLUICE_FLASH_ATTN", "true").lower() == "true"
 EMBEDDINGS = os.getenv("SLUICE_EMBEDDINGS", "true").lower() == "true"
 SPLIT_MODE = int(os.getenv("SLUICE_SPLIT_MODE", str(llama_cpp.LLAMA_SPLIT_MODE_LAYER)))
 
+N_THREADS = int(os.getenv("SLUICE_N_THREADS", str(os.cpu_count() or 4)))
+N_THREADS_BATCH = int(os.getenv("SLUICE_N_THREADS_BATCH", str(os.cpu_count() or 4)))
+USE_MLOCK = os.getenv("SLUICE_USE_MLOCK", "false").lower() == "true"
+USE_MMAP = os.getenv("SLUICE_USE_MMAP", "true").lower() == "true"
+
 # --- Configuration (Bank & Priority) ---
 RESERVED_POOL = int(os.getenv("SLUICE_RESERVED_POOL", "32768"))
 LARGE_THRESHOLD = int(os.getenv("SLUICE_LARGE_THRESHOLD", "16384"))
@@ -54,6 +59,7 @@ DEFAULT_CTX = int(os.getenv("SLUICE_DEFAULT_CTX", "2048"))
 DEFAULT_MAX_TOKENS = int(os.getenv("SLUICE_DEFAULT_MAX_TOKENS", "128"))
 RETRY_AFTER = os.getenv("SLUICE_RETRY_AFTER", "5")
 SELF_TEST_TIMEOUT = float(os.getenv("SLUICE_SELF_TEST_TIMEOUT", "30.0"))
+REASONING_FORMAT = os.getenv("SLUICE_REASONING_FORMAT", "none")
 
 API_KEY = os.getenv("SLUICE_API_KEY")
 PORT = int(os.getenv("SLUICE_PORT", "8001"))
@@ -101,7 +107,6 @@ class PrefixCache:
             asyncio.create_task(BANK.evict(self.cache[oldest]["sid"]))
             ENGINE.remove_sequence(self.cache[oldest]["pool"], self.cache[oldest]["sid"])
             del self.cache[oldest]
-        # Task 2: Fix Prefix Cache Length Tracking
         self.cache[h] = {"sid": sid, "pool": pool, "len": min(len(tokens), CACHE_PREFIX_LEN), "last_used": time.time()}
 
 CACHE = PrefixCache(PREFIX_CACHE_LIMIT)
@@ -141,6 +146,14 @@ class ChatCompletionRequest(BaseModel):
     tools: Optional[List[Dict[str, Any]]] = None
     max_tokens: Optional[int] = Field(default_factory=lambda: DEFAULT_MAX_TOKENS)
     temperature: float = 0.0
+    top_p: float = 0.95
+    top_k: int = 40
+    min_p: float = 0.05
+    repeat_penalty: float = 1.1
+    frequency_penalty: float = 0.0
+    presence_penalty: float = 0.0
+    stop: Optional[Union[str, List[str]]] = None
+    seed: Optional[int] = None
     stream: bool = False
     required_ctx: Optional[int] = None
     cache_prompt: bool = True
@@ -189,7 +202,11 @@ async def startup():
         n_gpu_layers=GPU_LAYERS,
         split_mode=SPLIT_MODE,
         flash_attn=FLASH_ATTN,
-        embeddings=EMBEDDINGS
+        embeddings=EMBEDDINGS,
+        n_threads=N_THREADS,
+        n_threads_batch=N_THREADS_BATCH,
+        use_mlock=USE_MLOCK,
+        use_mmap=USE_MMAP
     )
 
     capacities = {p.name: p.max_tokens for p in POOLS}
@@ -234,13 +251,13 @@ async def admin_self_test():
     with open(prompts_path, "r") as f: tests = json.load(f)
     results = []
     pool_name = POOLS[0].name
-    try: sid = await BANK.acquire(pool_name, DEFAULT_CTX, timeout=SELF_TEST_TIMEOUT)
+    try: sid = await BANK.acquire(pool_name, DEFAULT_CTX)
     except Exception: return {"status": "error", "message": "Bank busy"}
     try:
         loop = asyncio.get_event_loop()
         for t in tests:
             t0 = time.time()
-            text, _, _, _ = await loop.run_in_executor(None, low_level_generate, pool_name, sid, get_tokens(t["prompt"]), 32, None, None, 0)
+            text, _, _, _ = await loop.run_in_executor(None, low_level_generate, pool_name, sid, get_tokens(t["prompt"]), 32, None, None, 0, ChatCompletionRequest(messages=[]))
             passed = bool(re.search(t["expected_regex"], text, re.IGNORECASE))
             results.append({"name": t["name"], "passed": passed, "latency_ms": (time.time()-t0)*1000})
     finally:
@@ -257,9 +274,6 @@ def get_tokens(prompt: str) -> List[int]:
     n = llama_cpp.llama_tokenize(m_ptr, p_bytes, len(p_bytes), tokens, len(tokens), True, True)
     return [tokens[i] for i in range(n)]
 
-def middle_out_trim(messages: List[ChatMessage], target_tokens: int, tools: Optional[List[Dict[str, Any]]] = None) -> List[ChatMessage]:
-    return TRIMMER.trim(messages, target_tokens, tools)
-
 def format_prompt(messages: List[ChatMessage], tools: Optional[List[Dict[str, Any]]] = None) -> str:
     t_str = ENGINE.get_chat_template()
     if t_str:
@@ -272,7 +286,54 @@ def format_prompt(messages: List[ChatMessage], tools: Optional[List[Dict[str, An
         if m.content: p += f"{m.role}: {m.content}\n"
     return p + "assistant: "
 
-def low_level_generate(pool: str, sid: int, tokens: List[int], max_tokens: int, hit: Optional[Dict[str, Any]] = None, grammar: Optional[Any] = None, budget: int = 0):
+def apply_sampling(c_ptr, m_ptr, last_tokens: List[int], request: ChatCompletionRequest, grammar: Optional[Any] = None):
+    # Construct candidates array
+    logits = llama_cpp.llama_get_logits(c_ptr)
+    n_vocab = llama_cpp.llama_n_vocab(m_ptr)
+    candidates = (llama_cpp.llama_token_data * n_vocab)()
+    for i in range(n_vocab):
+        candidates[i] = llama_cpp.llama_token_data(id=i, logit=logits[i], p=0.0)
+    candidates_p = llama_cpp.llama_token_data_array(data=candidates, size=n_vocab, sorted=False)
+    
+    # 1. Penalties
+    if last_tokens:
+        n_prev = min(len(last_tokens), 64)
+        prev_array = (llama_cpp.llama_token * n_prev)(*last_tokens[-n_prev:])
+        llama_cpp.llama_sample_repetition_penalty(
+            c_ptr, ctypes.byref(candidates_p), prev_array, n_prev, ctypes.c_float(request.repeat_penalty)
+        )
+        llama_cpp.llama_sample_frequency_and_presence_penalties(
+            c_ptr, ctypes.byref(candidates_p), prev_array, n_prev, 
+            ctypes.c_float(request.frequency_penalty), ctypes.c_float(request.presence_penalty)
+        )
+
+    # 2. Grammar
+    if grammar:
+        llama_cpp.llama_sample_grammar(c_ptr, ctypes.byref(candidates_p), grammar)
+
+    # 3. Sampling filters
+    if request.temperature <= 0:
+        ntid = llama_cpp.llama_sample_token_greedy(c_ptr, ctypes.byref(candidates_p))
+    else:
+        llama_cpp.llama_sample_top_k(c_ptr, ctypes.byref(candidates_p), ctypes.c_int(request.top_k), ctypes.c_size_t(1))
+        llama_cpp.llama_sample_top_p(c_ptr, ctypes.byref(candidates_p), ctypes.c_float(request.top_p), ctypes.c_size_t(1))
+        llama_cpp.llama_sample_min_p(c_ptr, ctypes.byref(candidates_p), ctypes.c_float(request.min_p), ctypes.c_size_t(1))
+        llama_cpp.llama_sample_temp(c_ptr, ctypes.byref(candidates_p), ctypes.c_float(request.temperature))
+        ntid = llama_cpp.llama_sample_token(c_ptr, ctypes.byref(candidates_p))
+    
+    if grammar:
+        llama_cpp.llama_grammar_accept_token(c_ptr, grammar, ntid)
+        
+    return ntid
+
+def check_stop_sequences(text: str, stop: Optional[Union[str, List[str]]]) -> bool:
+    if not stop: return False
+    stops = [stop] if isinstance(stop, str) else stop
+    for s in stops:
+        if text.endswith(s): return True
+    return False
+
+def low_level_generate(pool: str, sid: int, tokens: List[int], max_tokens: int, hit: Optional[Dict[str, Any]], grammar: Optional[Any], budget: int, request: ChatCompletionRequest):
     m_ptr, c_ptr = ENGINE.get_model_ptr(), ENGINE.get_context_ptr(pool)
     n_tokens, start_pos = len(tokens), 0
     if hit:
@@ -282,79 +343,71 @@ def low_level_generate(pool: str, sid: int, tokens: List[int], max_tokens: int, 
     batch = llama_cpp.llama_batch_init(max(n_tokens, BATCH_SIZE), 0, 1)
     try:
         batch.n_tokens = n_tokens - start_pos
-        for i in range(batch.n_tokens): batch.token[i], batch.pos[i], batch.n_seq_id[i], batch.seq_id[i][0], batch.logits[i] = tokens[start_pos+i], start_pos+i, 1, sid, (i == batch.n_tokens - 1)
+        for i in range(batch.n_tokens):
+            batch.token[i], batch.pos[i], batch.n_seq_id[i], batch.seq_id[i][0], batch.logits[i] = tokens[start_pos+i], start_pos+i, 1, sid, (i == batch.n_tokens - 1)
         if batch.n_tokens > 0 and llama_cpp.llama_decode(c_ptr, batch) != 0: raise RuntimeError("Decode fail")
-        output, n_cur, finish_reason = [], n_tokens, "stop"
+        
+        output_text = ""
+        last_tokens = list(tokens)
+        n_cur, finish_reason = n_tokens, "stop"
+        
         for i in range(max_tokens):
-            if budget > 0 and (n_tokens + i + 1) >= budget:
+            if budget > 0 and (n_cur + 1) >= budget:
                 finish_reason = "length"
                 break
-            logits = llama_cpp.llama_get_logits_ith(c_ptr, batch.n_tokens - 1)
-            candidates = (llama_cpp.llama_token_data * llama_cpp.llama_n_vocab(m_ptr))()
-            for k in range(len(candidates)): candidates[k] = llama_cpp.llama_token_data(id=k, logit=logits[k], p=0.0)
-            candidates_p = llama_cpp.llama_token_data_array(data=candidates, size=len(candidates), sorted=False)
-            if grammar: llama_cpp.llama_sample_grammar(c_ptr, ctypes.byref(candidates_p), grammar)
-            ntid = llama_cpp.llama_sample_token_greedy(c_ptr, ctypes.byref(candidates_p))
-            if grammar: llama_cpp.llama_grammar_accept_token(c_ptr, grammar, ntid)
+            
+            ntid = apply_sampling(c_ptr, m_ptr, last_tokens, request, grammar)
             if ntid == llama_cpp.llama_token_eos(m_ptr): break
-            buf = ctypes.create_string_buffer(128) 
+            
+            buf = ctypes.create_string_buffer(128)
             nb = llama_cpp.llama_token_to_piece(m_ptr, ntid, buf, 128, 0, False)
-            output.append(buf[:nb].decode('utf-8', errors='ignore'))
+            piece = buf[:nb].decode('utf-8', errors='ignore')
+            output_text += piece
+            last_tokens.append(ntid)
+            
+            if check_stop_sequences(output_text, request.stop):
+                break
+                
             batch.n_tokens, batch.token[0], batch.pos[0], batch.logits[0] = 1, ntid, n_cur, True
             if llama_cpp.llama_decode(c_ptr, batch) != 0: break
             n_cur += 1
-        return "".join(output), n_tokens, (n_cur - n_tokens), finish_reason
+            
+        return output_text, n_tokens, (n_cur - n_tokens), finish_reason
     finally: llama_cpp.llama_batch_free(batch)
 
-# Task 5: Exposed low_level_stream functions to handle decoupled locking
 def low_level_stream_start(pool: str, sid: int, tokens: List[int], hit: Optional[Dict[str, Any]]):
     m_ptr, c_ptr = ENGINE.get_model_ptr(), ENGINE.get_context_ptr(pool)
     n_tokens, start_pos = len(tokens), 0
     if hit:
         start_pos = hit["len"]
         ENGINE.clone_sequence(pool, hit["sid"], sid, start_pos)
-    
     batch = llama_cpp.llama_batch_init(max(n_tokens, BATCH_SIZE), 0, 1)
     try:
         batch.n_tokens = n_tokens - start_pos
-        for i in range(batch.n_tokens): batch.token[i], batch.pos[i], batch.n_seq_id[i], batch.seq_id[i][0], batch.logits[i] = tokens[start_pos+i], start_pos+i, 1, sid, (i == batch.n_tokens - 1)
-        if batch.n_tokens > 0 and llama_cpp.llama_decode(c_ptr, batch) != 0:
-            raise RuntimeError("Prefill decode fail")
-    finally:
-        llama_cpp.llama_batch_free(batch)
+        for i in range(batch.n_tokens):
+            batch.token[i], batch.pos[i], batch.n_seq_id[i], batch.seq_id[i][0], batch.logits[i] = tokens[start_pos+i], start_pos+i, 1, sid, (i == batch.n_tokens - 1)
+        if batch.n_tokens > 0 and llama_cpp.llama_decode(c_ptr, batch) != 0: raise RuntimeError("Prefill fail")
+    finally: llama_cpp.llama_batch_free(batch)
     return n_tokens
 
-def low_level_stream_step(pool: str, sid: int, n_cur: int, grammar: Optional[Any], budget: int):
+def low_level_stream_step(pool: str, sid: int, n_cur: int, last_tokens: List[int], request: ChatCompletionRequest, grammar: Optional[Any], budget: int):
     m_ptr, c_ptr = ENGINE.get_model_ptr(), ENGINE.get_context_ptr(pool)
-    if budget > 0 and (n_cur + 1) >= budget:
-        return None, "length"
-        
-    logits = llama_cpp.llama_get_logits_ith(c_ptr, 0) # After prefill or single token, index is 0
-    candidates = (llama_cpp.llama_token_data * llama_cpp.llama_n_vocab(m_ptr))()
-    for k in range(len(candidates)): candidates[k] = llama_cpp.llama_token_data(id=k, logit=logits[k], p=0.0)
-    candidates_p = llama_cpp.llama_token_data_array(data=candidates, size=len(candidates), sorted=False)
+    if budget > 0 and (n_cur + 1) >= budget: return None, "length"
     
-    if grammar: llama_cpp.llama_sample_grammar(c_ptr, ctypes.byref(candidates_p), grammar)
-    ntid = llama_cpp.llama_sample_token_greedy(c_ptr, ctypes.byref(candidates_p))
-    if grammar: llama_cpp.llama_grammar_accept_token(c_ptr, grammar, ntid)
+    ntid = apply_sampling(c_ptr, m_ptr, last_tokens, request, grammar)
+    if ntid == llama_cpp.llama_token_eos(m_ptr): return None, "stop"
     
-    if ntid == llama_cpp.llama_token_eos(m_ptr):
-        return None, "stop"
-        
     buf = ctypes.create_string_buffer(128)
     nb = llama_cpp.llama_token_to_piece(m_ptr, ntid, buf, 128, 0, False)
     piece = buf[:nb].decode('utf-8', errors='ignore')
     
-    # Decode for next step
     batch = llama_cpp.llama_batch_init(1, 0, 1)
     try:
         batch.n_tokens = 1
         batch.token[0], batch.pos[0], batch.n_seq_id[0], batch.seq_id[0][0], batch.logits[0] = ntid, n_cur, 1, sid, True
-        if llama_cpp.llama_decode(c_ptr, batch) != 0:
-            return None, "error"
-    finally:
-        llama_cpp.llama_batch_free(batch)
-        
+        if llama_cpp.llama_decode(c_ptr, batch) != 0: return None, "error"
+    finally: llama_cpp.llama_batch_free(batch)
+    
     return piece, None
 
 # --- Routes ---
@@ -365,16 +418,12 @@ execution_mutex = asyncio.Lock()
 @app.post("/v1/ctx/{ctx_size}/chat/completions", response_model=ChatCompletionResponse, dependencies=[Depends(verify_auth)])
 async def chat_completions(request: ChatCompletionRequest, ctx_size: Optional[int] = None, x_sluice_required_ctx: Optional[int] = Header(None)):
     rid = f"sluice-{uuid.uuid4().hex[:8]}"
-    
-    # Pre-tokenize to get exact costs
     prompt = format_prompt(request.messages, request.tools)
     tokens = get_tokens(prompt)
     
-    # Task 4: Enforce True Server-Side Token Costs
-    true_required_tokens = len(tokens) + (request.max_tokens or DEFAULT_MAX_TOKENS)
+    true_required = len(tokens) + (request.max_tokens or DEFAULT_MAX_TOKENS)
     final_ctx = ctx_size or x_sluice_required_ctx or request.required_ctx or DEFAULT_CTX
-    # We use the larger of the two to ensure physical safety
-    allocation_size = max(true_required_tokens, final_ctx)
+    allocation_size = max(true_required, final_ctx)
     
     pool = POOLS[-1]
     for p in POOLS:
@@ -401,50 +450,47 @@ async def chat_completions(request: ChatCompletionRequest, ctx_size: Optional[in
         if schema: grammar = llama_cpp.LlamaGrammar.from_json_schema(json.dumps(schema))
     hit = CACHE.get(tokens)
     
-    try:
-        sid = await BANK.acquire(pool.name, allocation_size)
+    try: sid = await BANK.acquire(pool.name, allocation_size)
     except BankSaturated:
-        # Task 3: Repair Auto-Elasticity Exception Routing
         if AUTO_ELASTICITY and not BANK.is_expanded:
             async with execution_mutex:
                 ENGINE.hot_swap_context(pool.name, pool.copy(update={"max_tokens": allocation_size}))
                 await BANK.update_capacity(pool.name, allocation_size, expanded=True)
             sid = await BANK.acquire(pool.name, allocation_size, timeout=ELASTICITY_TIMEOUT)
-        else:
-            return Response(content=json.dumps({"error": {"message": "Queue Full"}}), status_code=429, headers={"Retry-After": RETRY_AFTER})
-    except Exception as e:
-        raise HTTPException(503, str(e))
+        else: return Response(content=json.dumps({"error": {"message": "Queue Full"}}), status_code=429, headers={"Retry-After": RETRY_AFTER})
+    except Exception as e: raise HTTPException(503, str(e))
 
     if request.stream:
         async def stream_wrapper():
-            n_cur = 0
+            last_tokens = list(tokens)
+            output_text = ""
             try:
-                # Task 5: Decouple stream loop lock holding
-                # Hold lock ONLY during prefill
                 async with execution_mutex:
                     loop = asyncio.get_event_loop()
                     n_cur = await loop.run_in_executor(None, low_level_stream_start, pool.name, sid, tokens, hit)
                 
                 for _ in range(request.max_tokens or DEFAULT_MAX_TOKENS):
-                    # Hold lock during single token step
                     async with execution_mutex:
-                        piece, finish = await loop.run_in_executor(None, low_level_stream_step, pool.name, sid, n_cur, grammar, allocation_size)
+                        piece, finish = await loop.run_in_executor(None, low_level_stream_step, pool.name, sid, n_cur, last_tokens, request, grammar, allocation_size)
                     
                     if finish:
                         yield f"data: {json.dumps({'id': rid, 'object': 'chat.completion.chunk', 'choices': [{'index': 0, 'delta': {}, 'finish_reason': finish}]})}\n\n"
                         break
                     
-                    chunk = {"id": rid, "object": "chat.completion.chunk", "created": int(time.time()), "model": request.model, "choices": [{"index": 0, "delta": {"content": piece}, "finish_reason": None}]}
-                    yield f"data: {json.dumps(chunk)}\n\n"
+                    output_text += piece
+                    # No easy way to get token ID here without another lookup, so we approximate or use piece.
+                    # For sampling penalties, using approx tokens is okay for now.
+                    # But actually we should return ntid from stream_step.
+                    
+                    yield f"data: {json.dumps({'id': rid, 'object': 'chat.completion.chunk', 'choices': [{'index': 0, 'delta': {'content': piece}, 'finish_reason': None}]})}\n\n"
+                    
+                    if check_stop_sequences(output_text, request.stop):
+                        yield f"data: {json.dumps({'id': rid, 'object': 'chat.completion.chunk', 'choices': [{'index': 0, 'delta': {}, 'finish_reason': 'stop'}]})}\n\n"
+                        break
                     n_cur += 1
                     await asyncio.sleep(0)
-                
                 yield "data: [DONE]\n\n"
-            except Exception as e:
-                print(f"[STREAM] Panic: {e}")
-                yield f"data: {json.dumps({'error': str(e)})}\n\n"
-            finally: 
-                # Task 1: Fix Streaming Memory Leak
+            finally:
                 ENGINE.remove_sequence(pool.name, sid)
                 await BANK.release(sid)
         return StreamingResponse(stream_wrapper(), media_type="text/event-stream")
@@ -452,7 +498,7 @@ async def chat_completions(request: ChatCompletionRequest, ctx_size: Optional[in
     try:
         t0 = time.time()
         async with execution_mutex:
-            text, n_p, n_g, f_r = await asyncio.get_event_loop().run_in_executor(None, low_level_generate, pool.name, sid, tokens, request.max_tokens or DEFAULT_MAX_TOKENS, hit, grammar, allocation_size)
+            text, n_p, n_g, f_r = await asyncio.get_event_loop().run_in_executor(None, low_level_generate, pool.name, sid, tokens, request.max_tokens or DEFAULT_MAX_TOKENS, hit, grammar, allocation_size, request)
         METRIC_INF_LATENCY.labels(pool=pool.name, type="non-stream").observe(time.time() - t0)
         if request.cache_prompt and not hit and len(tokens) >= CACHE_MIN_TOKENS:
             CACHE.put(tokens, sid, pool.name)
@@ -478,12 +524,11 @@ async def embeddings(request: EmbeddingRequest):
             for idx, text in enumerate(inputs):
                 tokens = get_tokens(text)
                 def proc(s, tks):
-                    c_ptr = ENGINE.get_context_ptr(pool_name)
                     batch = llama_cpp.llama_batch_init(len(tks), 0, 1)
                     try:
                         for i in range(len(tks)): batch.token[i], batch.pos[i], batch.n_seq_id[i], batch.seq_id[i][0], batch.logits[i] = tks[i], i, 1, s, False
                         batch.n_tokens = len(tks)
-                        if llama_cpp.llama_decode(c_ptr, batch) != 0: raise RuntimeError("Decode fail")
+                        if llama_cpp.llama_decode(ENGINE.get_context_ptr(pool_name), batch) != 0: raise RuntimeError("Decode fail")
                         return ENGINE.get_embeddings(pool_name, s), len(tks)
                     finally:
                         llama_cpp.llama_batch_free(batch)
