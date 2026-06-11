@@ -5,6 +5,7 @@ import time
 import uuid
 import json
 import re
+import argparse
 from typing import Optional, List, Dict, Any, Generator, Union
 from fastapi import FastAPI, HTTPException, Body, Header, Path, Response, Depends
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -18,69 +19,99 @@ from .engine import SluiceEngine
 from .pools import PoolConfig, DEFAULT_POOLS
 from .middleware.trimmer import MiddleOutTrimmer
 
-# --- Configuration (Hardware & Performance) ---
-MODEL_PATH = os.getenv("SLUICE_MODEL_PATH", "/models/gguf/model.gguf")
-MMPROJ_PATH = os.getenv("SLUICE_MMPROJ_PATH")
-TENSOR_SPLIT = os.getenv("SLUICE_TENSOR_SPLIT")
-BATCH_SIZE = int(os.getenv("SLUICE_BATCH_SIZE", "512"))
-UBATCH_SIZE = int(os.getenv("SLUICE_UBATCH_SIZE", "256"))
-GPU_LAYERS = int(os.getenv("SLUICE_GPU_LAYERS", "-1"))
-FLASH_ATTN = os.getenv("SLUICE_FLASH_ATTN", "true").lower() == "true"
+# --- CLI & Environment Mapping ---
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Llama-CPP Sluice: Drop-in Asymmetric Inference Server")
+    
+    # Standard llama-server flags
+    parser.add_argument("-m", "--model", type=str, default=os.getenv("SLUICE_MODEL_PATH", "/models/gguf/model.gguf"), help="Path to GGUF model file")
+    parser.add_argument("--mmproj", type=str, default=os.getenv("SLUICE_MMPROJ_PATH"), help="Path to multi-modal projector file")
+    parser.add_argument("--port", type=int, default=int(os.getenv("SLUICE_PORT", "8001")), help="Port to listen on")
+    parser.add_argument("--host", type=str, default=os.getenv("SLUICE_HOST", "0.0.0.0"), help="Host to bind to")
+    parser.add_argument("--api-key", type=str, default=os.getenv("SLUICE_API_KEY"), help="API Key for authentication")
+    parser.add_argument("-c", "--ctx-size", type=int, default=int(os.getenv("SLUICE_BASE_POOL", "2048")), help="Base context pool size")
+    parser.add_argument("-b", "--batch-size", type=int, default=int(os.getenv("SLUICE_BATCH_SIZE", "512")), help="Batch size for prefill")
+    parser.add_argument("-ub", "--ubatch-size", type=int, default=int(os.getenv("SLUICE_UBATCH_SIZE", "256")), help="Micro-batch size")
+    parser.add_argument("-fa", "--flash-attn", action="store_true", default=os.getenv("SLUICE_FLASH_ATTN", "true").lower() == "true", help="Enable Flash Attention")
+    parser.add_argument("-ts", "--tensor-split", type=str, default=os.getenv("SLUICE_TENSOR_SPLIT"), help="Fraction of the model to offload to each GPU (e.g. 1,1)")
+    parser.add_argument("-sm", "--split-mode", type=int, default=int(os.getenv("SLUICE_SPLIT_MODE", "2")), help="Split mode: 0=none, 1=row, 2=layer")
+    parser.add_argument("--mlock", action="store_true", default=os.getenv("SLUICE_USE_MLOCK", "false").lower() == "true", help="Force system to keep model in RAM")
+    parser.add_argument("--no-mmap", action="store_false", dest="mmap", default=os.getenv("SLUICE_USE_MMAP", "true").lower() == "true", help="Disable memory-map model")
+    parser.add_argument("-t", "--threads", type=int, default=int(os.getenv("SLUICE_N_THREADS", str(os.cpu_count() or 4))), help="Number of threads to use during generation")
+    parser.add_argument("-tb", "--threads-batch", type=int, default=int(os.getenv("SLUICE_N_THREADS_BATCH", str(os.cpu_count() or 4))), help="Number of threads to use during batch prefill")
+    parser.add_argument("--alias", type=str, default=os.getenv("SLUICE_MODEL_ALIAS", "sluice-model"), help="Model alias for API responses")
+    parser.add_argument("--ssl-key-file", type=str, default=os.getenv("SLUICE_SSL_KEY_FILE"), help="Path to SSL key file")
+    parser.add_argument("--ssl-cert-file", type=str, default=os.getenv("SLUICE_SSL_CERT_FILE"), help="Path to SSL cert file")
+    parser.add_argument("--reasoning-format", type=str, default=os.getenv("SLUICE_REASONING_FORMAT", "none"), help="Reasoning format (none, deepseek, etc.)")
+
+    # Sluice-specific flags
+    parser.add_argument("--reserved-pool", type=int, default=int(os.getenv("SLUICE_RESERVED_POOL", "32768")), help="Tokens reserved for large requests")
+    parser.add_argument("--large-threshold", type=int, default=int(os.getenv("SLUICE_LARGE_THRESHOLD", "16384")), help="Threshold for 'Large' request classification")
+    parser.add_argument("--auto-elasticity", action="store_true", default=os.getenv("SLUICE_AUTO_ELASTICITY", "false").lower() == "true", help="Enable automatic context expansion")
+    parser.add_argument("--auto-defrag", action="store_true", default=os.getenv("SLUICE_AUTO_DEFRAG", "true").lower() == "true", help="Enable automatic KV cache defragmentation")
+    parser.add_argument("--pools", type=str, default=os.getenv("SLUICE_POOLS"), help="JSON string for complex multi-pool configurations")
+    parser.add_argument("--no-adaptive-trimming", action="store_false", dest="trimming", default=os.getenv("SLUICE_ENABLE_ADAPTIVE_TRIMMING", "true").lower() == "true", help="Disable middle-out context trimming")
+
+    # If being run by pytest or other tools, don't parse sys.argv
+    if "pytest" in sys.modules or os.getenv("PYTEST_CURRENT_TEST"):
+        return parser.parse_args([])
+    return parser.parse_args()
+
+import sys # Needed for sys.modules check above
+
+ARGS = parse_args()
+
+# --- Config Initialization ---
+MODEL_PATH = ARGS.model
+MMPROJ_PATH = ARGS.mmproj
+TENSOR_SPLIT = ARGS.tensor_split
+BATCH_SIZE = ARGS.batch_size
+UBATCH_SIZE = ARGS.ubatch_size
+GPU_LAYERS = int(os.getenv("SLUICE_GPU_LAYERS", "-1")) 
+FLASH_ATTN = ARGS.flash_attn
 EMBEDDINGS = os.getenv("SLUICE_EMBEDDINGS", "true").lower() == "true"
-SPLIT_MODE = int(os.getenv("SLUICE_SPLIT_MODE", str(llama_cpp.LLAMA_SPLIT_MODE_LAYER)))
-
-N_THREADS = int(os.getenv("SLUICE_N_THREADS", str(os.cpu_count() or 4)))
-N_THREADS_BATCH = int(os.getenv("SLUICE_N_THREADS_BATCH", str(os.cpu_count() or 4)))
-USE_MLOCK = os.getenv("SLUICE_USE_MLOCK", "false").lower() == "true"
-USE_MMAP = os.getenv("SLUICE_USE_MMAP", "true").lower() == "true"
-
-# Task 7: RoPE Scaling Env Vars
-ROPE_FREQ_BASE = os.getenv("SLUICE_ROPE_FREQ_BASE")
+SPLIT_MODE = ARGS.split_mode
+N_THREADS = ARGS.threads
+N_THREADS_BATCH = ARGS.threads_batch
+USE_MLOCK = ARGS.mlock
+USE_MMAP = ARGS.mmap
+ROPE_FREQ_BASE = os.getenv("SLUICE_ROPE_FREQ_BASE") 
 ROPE_FREQ_SCALE = os.getenv("SLUICE_ROPE_FREQ_SCALE")
-
-# --- Configuration (Bank & Priority) ---
-RESERVED_POOL = int(os.getenv("SLUICE_RESERVED_POOL", "32768"))
-LARGE_THRESHOLD = int(os.getenv("SLUICE_LARGE_THRESHOLD", "16384"))
+RESERVED_POOL = ARGS.reserved_pool
+LARGE_THRESHOLD = ARGS.large_threshold
 SCAVENGE_HOOK = os.getenv("SLUICE_SCAVENGE_HOOK")
 RECOVERY_HOOK = os.getenv("SLUICE_RECOVERY_HOOK")
 SCAVENGE_DELAY = float(os.getenv("SLUICE_SCAVENGE_DELAY", "15.0"))
-
-# --- Configuration (Elasticity & Cache) ---
-AUTO_ELASTICITY = os.getenv("SLUICE_AUTO_ELASTICITY", "false").lower() == "true"
+AUTO_ELASTICITY = ARGS.auto_elasticity
 ELASTICITY_TIMEOUT = float(os.getenv("SLUICE_ELASTICITY_TIMEOUT", "10.0"))
-AUTO_DEFRAG = os.getenv("SLUICE_AUTO_DEFRAG", "true").lower() == "true"
+AUTO_DEFRAG = ARGS.auto_defrag
 DEFRAG_THRESHOLD = float(os.getenv("SLUICE_DEFRAG_THRESHOLD", "0.15"))
 ELASTICITY_INTERVAL = float(os.getenv("SLUICE_ELASTICITY_INTERVAL", "5.0"))
-
 CACHE_MIN_TOKENS = int(os.getenv("SLUICE_CACHE_MIN_TOKENS", "128"))
 CACHE_PREFIX_LEN = int(os.getenv("SLUICE_CACHE_PREFIX_LEN", "512"))
 PREFIX_CACHE_LIMIT = int(os.getenv("SLUICE_PREFIX_CACHE_LIMIT", "10"))
-
-# --- Configuration (Negotiation & Defaults) ---
-ENABLE_ADAPTIVE_TRIMMING = os.getenv("SLUICE_ENABLE_ADAPTIVE_TRIMMING", "true").lower() == "true"
+ENABLE_ADAPTIVE_TRIMMING = ARGS.trimming
 TRIM_FLOOR = int(os.getenv("SLUICE_TRIM_FLOOR", "4096"))
-DEFAULT_CTX = int(os.getenv("SLUICE_DEFAULT_CTX", "2048"))
+DEFAULT_CTX = ARGS.ctx_size
 DEFAULT_MAX_TOKENS = int(os.getenv("SLUICE_DEFAULT_MAX_TOKENS", "128"))
 RETRY_AFTER = os.getenv("SLUICE_RETRY_AFTER", "5")
 SELF_TEST_TIMEOUT = float(os.getenv("SLUICE_SELF_TEST_TIMEOUT", "30.0"))
-REASONING_FORMAT = os.getenv("SLUICE_REASONING_FORMAT", "none")
-
-# Task 6: Custom Model Alias
-MODEL_ALIAS = os.getenv("SLUICE_MODEL_ALIAS", "sluice-model")
-
-# Task 8: SSL Support
-SSL_KEY_FILE = os.getenv("SLUICE_SSL_KEY_FILE")
-SSL_CERT_FILE = os.getenv("SLUICE_SSL_CERT_FILE")
-
-API_KEY = os.getenv("SLUICE_API_KEY")
-PORT = int(os.getenv("SLUICE_PORT", "8001"))
-HOST = os.getenv("SLUICE_HOST", "0.0.0.0")
+REASONING_FORMAT = ARGS.reasoning_format
+MODEL_ALIAS = ARGS.alias
+SSL_KEY_FILE = ARGS.ssl_key_file
+SSL_CERT_FILE = ARGS.ssl_cert_file
+API_KEY = ARGS.api_key
+PORT = ARGS.port
+HOST = ARGS.host
 
 # Load Pools
-POOLS_JSON = os.getenv("SLUICE_POOLS")
-if POOLS_JSON: POOLS = [PoolConfig(**p) for p in json.loads(POOLS_JSON)]
-else: POOLS = DEFAULT_POOLS
-BASE_POOL = POOLS[0].max_tokens 
+if ARGS.pools: POOLS = [PoolConfig(**p) for p in json.loads(ARGS.pools)]
+else:
+    POOLS = [
+        PoolConfig(name="precision", max_tokens=ARGS.ctx_size, precision_threshold=ARGS.ctx_size // 2),
+        PoolConfig(name="efficiency", max_tokens=ARGS.ctx_size * 4, type_k=llama_cpp.GGML_TYPE_Q4_0, type_v=llama_cpp.GGML_TYPE_Q4_0, precision_threshold=0)
+    ]
 
 app = FastAPI(title="Llama-CPP Sluice: Fully Configurable Asymmetric Server")
 security = HTTPBearer(auto_error=False)
@@ -204,7 +235,6 @@ async def startup():
         try: ts_list = [float(x.strip()) for x in TENSOR_SPLIT.split(",")]
         except Exception: pass
 
-    # Task 7: Parse RoPE scaling
     r_base = float(ROPE_FREQ_BASE) if ROPE_FREQ_BASE else None
     r_scale = float(ROPE_FREQ_SCALE) if ROPE_FREQ_SCALE else None
 
@@ -518,7 +548,6 @@ async def chat_completions(request: ChatCompletionRequest, ctx_size: Optional[in
         else:
             ENGINE.remove_sequence(pool.name, sid)
             await BANK.release(sid)
-        # Task 6: Return MODEL_ALIAS
         return ChatCompletionResponse(id=rid, created=int(time.time()), model=MODEL_ALIAS, choices=[{"index": 0, "message": {"role": "assistant", "content": text}, "finish_reason": f_r}], usage={"prompt_tokens": n_p, "completion_tokens": n_g, "total_tokens": n_p + n_g})
     except Exception as e:
         ENGINE.remove_sequence(pool.name, sid)
@@ -549,24 +578,20 @@ async def embeddings(request: EmbeddingRequest):
                 vec, n = await asyncio.get_event_loop().run_in_executor(None, proc, sid, tokens)
                 data.append({"object": "embedding", "index": idx, "embedding": vec})
                 total_p += n
-        # Task 6: Return MODEL_ALIAS
         return EmbeddingResponse(model=MODEL_ALIAS, data=data, usage={"prompt_tokens": total_p, "total_tokens": total_p})
     finally: await BANK.release(sid)
 
 if __name__ == "__main__":
     import uvicorn
-    # Task 8: Optional SSL binding
     uvicorn_kwargs = {
         "app": app,
         "host": HOST,
         "port": PORT
     }
-    if SSL_CERT_FILE and SSL_KEY_FILE:
-        if os.path.exists(SSL_CERT_FILE) and os.path.exists(SSL_KEY_FILE):
-            print(f"[SERVER] Starting with SSL support: {SSL_CERT_FILE}")
-            uvicorn_kwargs["ssl_keyfile"] = SSL_KEY_FILE
-            uvicorn_kwargs["ssl_certfile"] = SSL_CERT_FILE
-        else:
-            print(f"[WARNING] SSL files not found: {SSL_CERT_FILE} or {SSL_KEY_FILE}")
+    if ARGS.ssl_cert_file and ARGS.ssl_key_file:
+        if os.path.exists(ARGS.ssl_cert_file) and os.path.exists(ARGS.ssl_key_file):
+            print(f"[SERVER] Starting with SSL support: {ARGS.ssl_cert_file}")
+            uvicorn_kwargs["ssl_keyfile"] = ARGS.ssl_key_file
+            uvicorn_kwargs["ssl_certfile"] = ARGS.ssl_cert_file
             
     uvicorn.run(**uvicorn_kwargs)
