@@ -101,7 +101,8 @@ class PrefixCache:
             asyncio.create_task(BANK.evict(self.cache[oldest]["sid"]))
             ENGINE.remove_sequence(self.cache[oldest]["pool"], self.cache[oldest]["sid"])
             del self.cache[oldest]
-        self.cache[h] = {"sid": sid, "pool": pool, "len": CACHE_PREFIX_LEN, "last_used": time.time()}
+        # Task 2: Fix Prefix Cache Length Tracking
+        self.cache[h] = {"sid": sid, "pool": pool, "len": min(len(tokens), CACHE_PREFIX_LEN), "last_used": time.time()}
 
 CACHE = PrefixCache(PREFIX_CACHE_LIMIT)
 ENGINE: Optional[SluiceEngine] = None
@@ -278,7 +279,6 @@ def low_level_generate(pool: str, sid: int, tokens: List[int], max_tokens: int, 
         start_pos = hit["len"]
         ENGINE.clone_sequence(pool, hit["sid"], sid, start_pos)
     
-    # Respect BATCH_SIZE parameter
     batch = llama_cpp.llama_batch_init(max(n_tokens, BATCH_SIZE), 0, 1)
     try:
         batch.n_tokens = n_tokens - start_pos
@@ -306,40 +306,56 @@ def low_level_generate(pool: str, sid: int, tokens: List[int], max_tokens: int, 
         return "".join(output), n_tokens, (n_cur - n_tokens), finish_reason
     finally: llama_cpp.llama_batch_free(batch)
 
-def low_level_stream_generator(pool: str, sid: int, tokens: List[int], max_tokens: int, rid: str, model: str, hit: Optional[Dict[str, Any]] = None, grammar: Optional[Any] = None, budget: int = 0):
+# Task 5: Exposed low_level_stream functions to handle decoupled locking
+def low_level_stream_start(pool: str, sid: int, tokens: List[int], hit: Optional[Dict[str, Any]]):
     m_ptr, c_ptr = ENGINE.get_model_ptr(), ENGINE.get_context_ptr(pool)
     n_tokens, start_pos = len(tokens), 0
     if hit:
         start_pos = hit["len"]
         ENGINE.clone_sequence(pool, hit["sid"], sid, start_pos)
+    
     batch = llama_cpp.llama_batch_init(max(n_tokens, BATCH_SIZE), 0, 1)
     try:
         batch.n_tokens = n_tokens - start_pos
         for i in range(batch.n_tokens): batch.token[i], batch.pos[i], batch.n_seq_id[i], batch.seq_id[i][0], batch.logits[i] = tokens[start_pos+i], start_pos+i, 1, sid, (i == batch.n_tokens - 1)
-        if batch.n_tokens > 0 and llama_cpp.llama_decode(c_ptr, batch) != 0: return
-        n_cur, finish_reason = n_tokens, "stop"
-        for i in range(max_tokens):
-            if budget > 0 and (n_tokens + i + 1) >= budget:
-                finish_reason = "length"
-                break
-            logits = llama_cpp.llama_get_logits_ith(c_ptr, batch.n_tokens - 1)
-            candidates = (llama_cpp.llama_token_data * llama_cpp.llama_n_vocab(m_ptr))()
-            for k in range(len(candidates)): candidates[k] = llama_cpp.llama_token_data(id=k, logit=logits[k], p=0.0)
-            candidates_p = llama_cpp.llama_token_data_array(data=candidates, size=len(candidates), sorted=False)
-            if grammar: llama_cpp.llama_sample_grammar(c_ptr, ctypes.byref(candidates_p), grammar)
-            ntid = llama_cpp.llama_sample_token_greedy(c_ptr, ctypes.byref(candidates_p))
-            if grammar: llama_cpp.llama_grammar_accept_token(c_ptr, grammar, ntid)
-            if ntid == llama_cpp.llama_token_eos(m_ptr): break
-            buf = ctypes.create_string_buffer(128)
-            nb = llama_cpp.llama_token_to_piece(m_ptr, ntid, buf, 128, 0, False)
-            chunk = {"id": rid, "object": "chat.completion.chunk", "created": int(time.time()), "model": model, "choices": [{"index": 0, "delta": {"content": buf[:nb].decode('utf-8', errors='ignore')}, "finish_reason": None}]}
-            yield f"data: {json.dumps(chunk)}\n\n"
-            batch.n_tokens, batch.token[0], batch.pos[0], batch.logits[0] = 1, ntid, n_cur, True
-            if llama_cpp.llama_decode(c_ptr, batch) != 0: break
-            n_cur += 1
-        yield f"data: {json.dumps({'id': rid, 'object': 'chat.completion.chunk', 'created': int(time.time()), 'model': model, 'choices': [{'index': 0, 'delta': {}, 'finish_reason': finish_reason}]})}\n\n"
-        yield "data: [DONE]\n\n"
-    finally: llama_cpp.llama_batch_free(batch)
+        if batch.n_tokens > 0 and llama_cpp.llama_decode(c_ptr, batch) != 0:
+            raise RuntimeError("Prefill decode fail")
+    finally:
+        llama_cpp.llama_batch_free(batch)
+    return n_tokens
+
+def low_level_stream_step(pool: str, sid: int, n_cur: int, grammar: Optional[Any], budget: int):
+    m_ptr, c_ptr = ENGINE.get_model_ptr(), ENGINE.get_context_ptr(pool)
+    if budget > 0 and (n_cur + 1) >= budget:
+        return None, "length"
+        
+    logits = llama_cpp.llama_get_logits_ith(c_ptr, 0) # After prefill or single token, index is 0
+    candidates = (llama_cpp.llama_token_data * llama_cpp.llama_n_vocab(m_ptr))()
+    for k in range(len(candidates)): candidates[k] = llama_cpp.llama_token_data(id=k, logit=logits[k], p=0.0)
+    candidates_p = llama_cpp.llama_token_data_array(data=candidates, size=len(candidates), sorted=False)
+    
+    if grammar: llama_cpp.llama_sample_grammar(c_ptr, ctypes.byref(candidates_p), grammar)
+    ntid = llama_cpp.llama_sample_token_greedy(c_ptr, ctypes.byref(candidates_p))
+    if grammar: llama_cpp.llama_grammar_accept_token(c_ptr, grammar, ntid)
+    
+    if ntid == llama_cpp.llama_token_eos(m_ptr):
+        return None, "stop"
+        
+    buf = ctypes.create_string_buffer(128)
+    nb = llama_cpp.llama_token_to_piece(m_ptr, ntid, buf, 128, 0, False)
+    piece = buf[:nb].decode('utf-8', errors='ignore')
+    
+    # Decode for next step
+    batch = llama_cpp.llama_batch_init(1, 0, 1)
+    try:
+        batch.n_tokens = 1
+        batch.token[0], batch.pos[0], batch.n_seq_id[0], batch.seq_id[0][0], batch.logits[0] = ntid, n_cur, 1, sid, True
+        if llama_cpp.llama_decode(c_ptr, batch) != 0:
+            return None, "error"
+    finally:
+        llama_cpp.llama_batch_free(batch)
+        
+    return piece, None
 
 # --- Routes ---
 
@@ -348,51 +364,95 @@ execution_mutex = asyncio.Lock()
 @app.post("/v1/chat/completions", response_model=ChatCompletionResponse, dependencies=[Depends(verify_auth)])
 @app.post("/v1/ctx/{ctx_size}/chat/completions", response_model=ChatCompletionResponse, dependencies=[Depends(verify_auth)])
 async def chat_completions(request: ChatCompletionRequest, ctx_size: Optional[int] = None, x_sluice_required_ctx: Optional[int] = Header(None)):
-    final_ctx = ctx_size or x_sluice_required_ctx or request.required_ctx or DEFAULT_CTX
     rid = f"sluice-{uuid.uuid4().hex[:8]}"
+    
+    # Pre-tokenize to get exact costs
+    prompt = format_prompt(request.messages, request.tools)
+    tokens = get_tokens(prompt)
+    
+    # Task 4: Enforce True Server-Side Token Costs
+    true_required_tokens = len(tokens) + (request.max_tokens or DEFAULT_MAX_TOKENS)
+    final_ctx = ctx_size or x_sluice_required_ctx or request.required_ctx or DEFAULT_CTX
+    # We use the larger of the two to ensure physical safety
+    allocation_size = max(true_required_tokens, final_ctx)
+    
     pool = POOLS[-1]
     for p in POOLS:
-        if p.precision_threshold > 0 and final_ctx <= p.precision_threshold:
+        if p.precision_threshold > 0 and allocation_size <= p.precision_threshold:
             pool = p
             break
-    is_large = final_ctx >= LARGE_THRESHOLD
+            
+    is_large = allocation_size >= LARGE_THRESHOLD
     available = BANK.get_available_for_large(pool.name) if is_large else BANK.get_available_for_small(pool.name)
+    
     active_messages = request.messages
-    if ENABLE_ADAPTIVE_TRIMMING and final_ctx > available:
+    if ENABLE_ADAPTIVE_TRIMMING and allocation_size > available:
         if available >= TRIM_FLOOR:
-            active_messages = TRIMMER.trim(request.messages, available, request.tools)
-            final_ctx = available
+            active_messages = TRIMMER.trim(request.messages, available - (request.max_tokens or DEFAULT_MAX_TOKENS), request.tools)
+            prompt = format_prompt(active_messages, request.tools)
+            tokens = get_tokens(prompt)
+            allocation_size = len(tokens) + (request.max_tokens or DEFAULT_MAX_TOKENS)
         else:
             return Response(content=json.dumps({"error": {"message": "VRAM Full."}}), status_code=429, headers={"Retry-After": RETRY_AFTER})
-    prompt = format_prompt(active_messages, request.tools)
-    tokens = get_tokens(prompt)
+
     grammar = None
     if request.response_format and request.response_format.get("type") == "json_object":
         schema = request.response_format.get("schema")
         if schema: grammar = llama_cpp.LlamaGrammar.from_json_schema(json.dumps(schema))
     hit = CACHE.get(tokens)
-    try: sid = await BANK.acquire(pool.name, final_ctx)
-    except BankSaturated: return Response(content=json.dumps({"error": {"message": "Queue Full"}}), status_code=429, headers={"Retry-After": RETRY_AFTER})
-    except Exception as e:
+    
+    try:
+        sid = await BANK.acquire(pool.name, allocation_size)
+    except BankSaturated:
+        # Task 3: Repair Auto-Elasticity Exception Routing
         if AUTO_ELASTICITY and not BANK.is_expanded:
             async with execution_mutex:
-                ENGINE.hot_swap_context(pool.name, pool.copy(update={"max_tokens": final_ctx}))
-                await BANK.update_capacity(pool.name, final_ctx, expanded=True)
-            sid = await BANK.acquire(pool.name, final_ctx, timeout=ELASTICITY_TIMEOUT)
-        else: raise HTTPException(503, str(e))
+                ENGINE.hot_swap_context(pool.name, pool.copy(update={"max_tokens": allocation_size}))
+                await BANK.update_capacity(pool.name, allocation_size, expanded=True)
+            sid = await BANK.acquire(pool.name, allocation_size, timeout=ELASTICITY_TIMEOUT)
+        else:
+            return Response(content=json.dumps({"error": {"message": "Queue Full"}}), status_code=429, headers={"Retry-After": RETRY_AFTER})
+    except Exception as e:
+        raise HTTPException(503, str(e))
+
     if request.stream:
         async def stream_wrapper():
+            n_cur = 0
             try:
+                # Task 5: Decouple stream loop lock holding
+                # Hold lock ONLY during prefill
                 async with execution_mutex:
-                    for chunk in low_level_stream_generator(pool.name, sid, tokens, request.max_tokens or DEFAULT_MAX_TOKENS, rid, request.model, hit, grammar, final_ctx):
-                        yield chunk
-                        await asyncio.sleep(0)
-            finally: await BANK.release(sid)
+                    loop = asyncio.get_event_loop()
+                    n_cur = await loop.run_in_executor(None, low_level_stream_start, pool.name, sid, tokens, hit)
+                
+                for _ in range(request.max_tokens or DEFAULT_MAX_TOKENS):
+                    # Hold lock during single token step
+                    async with execution_mutex:
+                        piece, finish = await loop.run_in_executor(None, low_level_stream_step, pool.name, sid, n_cur, grammar, allocation_size)
+                    
+                    if finish:
+                        yield f"data: {json.dumps({'id': rid, 'object': 'chat.completion.chunk', 'choices': [{'index': 0, 'delta': {}, 'finish_reason': finish}]})}\n\n"
+                        break
+                    
+                    chunk = {"id": rid, "object": "chat.completion.chunk", "created": int(time.time()), "model": request.model, "choices": [{"index": 0, "delta": {"content": piece}, "finish_reason": None}]}
+                    yield f"data: {json.dumps(chunk)}\n\n"
+                    n_cur += 1
+                    await asyncio.sleep(0)
+                
+                yield "data: [DONE]\n\n"
+            except Exception as e:
+                print(f"[STREAM] Panic: {e}")
+                yield f"data: {json.dumps({'error': str(e)})}\n\n"
+            finally: 
+                # Task 1: Fix Streaming Memory Leak
+                ENGINE.remove_sequence(pool.name, sid)
+                await BANK.release(sid)
         return StreamingResponse(stream_wrapper(), media_type="text/event-stream")
+
     try:
         t0 = time.time()
         async with execution_mutex:
-            text, n_p, n_g, f_r = await asyncio.get_event_loop().run_in_executor(None, low_level_generate, pool.name, sid, tokens, request.max_tokens or DEFAULT_MAX_TOKENS, hit, grammar, final_ctx)
+            text, n_p, n_g, f_r = await asyncio.get_event_loop().run_in_executor(None, low_level_generate, pool.name, sid, tokens, request.max_tokens or DEFAULT_MAX_TOKENS, hit, grammar, allocation_size)
         METRIC_INF_LATENCY.labels(pool=pool.name, type="non-stream").observe(time.time() - t0)
         if request.cache_prompt and not hit and len(tokens) >= CACHE_MIN_TOKENS:
             CACHE.put(tokens, sid, pool.name)
@@ -402,6 +462,7 @@ async def chat_completions(request: ChatCompletionRequest, ctx_size: Optional[in
             await BANK.release(sid)
         return ChatCompletionResponse(id=rid, created=int(time.time()), model=request.model, choices=[{"index": 0, "message": {"role": "assistant", "content": text}, "finish_reason": f_r}], usage={"prompt_tokens": n_p, "completion_tokens": n_g, "total_tokens": n_p + n_g})
     except Exception as e:
+        ENGINE.remove_sequence(pool.name, sid)
         await BANK.release(sid)
         raise HTTPException(500, str(e))
 

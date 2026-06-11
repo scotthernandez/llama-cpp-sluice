@@ -35,12 +35,12 @@ def test_litellm_parsing_logic():
     assert parsed.choices[0].message.content == "Verified."
 
 def test_openai_streaming_format():
-    with patch("sluice.server.low_level_stream_generator") as mock_stream, \
+    with patch("sluice.server.low_level_stream_start", return_value=3), \
+         patch("sluice.server.low_level_stream_step") as mock_step, \
          patch("sluice.server.get_tokens", return_value=[1,2,3]):
-        def chunk_gen(*args, **kwargs):
-            yield 'data: {"id": "1", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"content": "Hi"}, "finish_reason": null}]}\n\n'
-            yield 'data: [DONE]\n\n'
-        mock_stream.side_effect = chunk_gen
+        
+        # (piece, finish_reason)
+        mock_step.side_effect = [("Hi", None), (None, "stop")]
         
         response = client.post("/v1/chat/completions", json={
             "messages": [{"role": "user", "content": "hi"}],
@@ -48,3 +48,4 @@ def test_openai_streaming_format():
         })
         assert response.status_code == 200
         assert "text/event-stream" in response.headers["content-type"]
+        assert "data: {" in response.text
