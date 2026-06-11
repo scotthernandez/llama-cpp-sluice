@@ -3,9 +3,10 @@ import time
 from typing import Dict, Optional
 
 class TokenBank:
-    def __init__(self, total_tokens: int, reserved_for_large: int):
+    def __init__(self, total_tokens: int, reserved_for_large: int, large_threshold: int = 16384):
         self.total = total_tokens
         self.reserved_for_large = reserved_for_large
+        self.large_threshold = large_threshold
         self.used = 0
         self.active_seqs: Dict[int, int] = {}
         self.seq_counter = 0
@@ -16,11 +17,11 @@ class TokenBank:
     async def acquire(self, requested_size: int, timeout: float = 60.0) -> int:
         """
         Acquires tokens from the bank. Blocks until space is available or timeout.
-        - Large requests (>= 16k) can use the ENTIRE pool.
+        - Large requests (>= large_threshold) can use the ENTIRE pool.
         - Small requests can only use (Total - Reserved).
         - Small requests are blocked if a Large request is waiting (Anti-Starvation).
         """
-        is_large = requested_size >= 16384
+        is_large = requested_size >= self.large_threshold
         start_time = time.time()
         
         async with self.condition:

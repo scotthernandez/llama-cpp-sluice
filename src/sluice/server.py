@@ -13,13 +13,14 @@ from .engine import SluiceEngine
 MODEL_PATH = os.getenv("SLUICE_MODEL_PATH", "/models/gguf/model.gguf")
 TOTAL_POOL = int(os.getenv("SLUICE_TOTAL_POOL", "98304"))
 RESERVED_POOL = int(os.getenv("SLUICE_RESERVED_POOL", "32768"))
+LARGE_THRESHOLD = int(os.getenv("SLUICE_LARGE_THRESHOLD", "16384"))
 PORT = int(os.getenv("SLUICE_PORT", "8001"))
 
 app = FastAPI(title="Llama-CPP Sluice: Dynamic Asymmetric Inference Server")
 
 # Global State
 ENGINE: Optional[SluiceEngine] = None
-BANK: TokenBank = TokenBank(TOTAL_POOL, RESERVED_POOL)
+BANK: TokenBank = TokenBank(TOTAL_POOL, RESERVED_POOL, LARGE_THRESHOLD)
 
 class InferenceRequest(BaseModel):
     prompt: str
