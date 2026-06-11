@@ -19,7 +19,9 @@ class SluiceEngine:
                  n_threads: Optional[int] = None,
                  n_threads_batch: Optional[int] = None,
                  use_mlock: bool = False,
-                 use_mmap: bool = True):
+                 use_mmap: bool = True,
+                 rope_freq_base: Optional[float] = None,
+                 rope_freq_scale: Optional[float] = None):
         print(f"[SLUICE] Initializing Multi-Pool Engine: {model_path}")
         self.model_path = model_path
         self.n_batch = n_batch
@@ -40,6 +42,14 @@ class SluiceEngine:
             ts_array = (llama_cpp.ctypes.c_float * len(tensor_split))(*tensor_split)
             mparams.tensor_split = ts_array
             print(f"[ENGINE] Applied explicit tensor split: {tensor_split}")
+
+        # Task 7: Integrate RoPE Scaling Context Extensions
+        if rope_freq_base is not None:
+            mparams.rope_freq_base = ctypes.c_float(rope_freq_base)
+            print(f"[ENGINE] Applied RoPE frequency base: {rope_freq_base}")
+        if rope_freq_scale is not None:
+            mparams.rope_freq_scale = ctypes.c_float(rope_freq_scale)
+            print(f"[ENGINE] Applied RoPE frequency scale: {rope_freq_scale}")
 
         self.model = LlamaModel(path_model=model_path, params=mparams, verbose=False)
         

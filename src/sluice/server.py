@@ -34,6 +34,10 @@ N_THREADS_BATCH = int(os.getenv("SLUICE_N_THREADS_BATCH", str(os.cpu_count() or 
 USE_MLOCK = os.getenv("SLUICE_USE_MLOCK", "false").lower() == "true"
 USE_MMAP = os.getenv("SLUICE_USE_MMAP", "true").lower() == "true"
 
+# Task 7: RoPE Scaling Env Vars
+ROPE_FREQ_BASE = os.getenv("SLUICE_ROPE_FREQ_BASE")
+ROPE_FREQ_SCALE = os.getenv("SLUICE_ROPE_FREQ_SCALE")
+
 # --- Configuration (Bank & Priority) ---
 RESERVED_POOL = int(os.getenv("SLUICE_RESERVED_POOL", "32768"))
 LARGE_THRESHOLD = int(os.getenv("SLUICE_LARGE_THRESHOLD", "16384"))
@@ -60,6 +64,13 @@ DEFAULT_MAX_TOKENS = int(os.getenv("SLUICE_DEFAULT_MAX_TOKENS", "128"))
 RETRY_AFTER = os.getenv("SLUICE_RETRY_AFTER", "5")
 SELF_TEST_TIMEOUT = float(os.getenv("SLUICE_SELF_TEST_TIMEOUT", "30.0"))
 REASONING_FORMAT = os.getenv("SLUICE_REASONING_FORMAT", "none")
+
+# Task 6: Custom Model Alias
+MODEL_ALIAS = os.getenv("SLUICE_MODEL_ALIAS", "sluice-model")
+
+# Task 8: SSL Support
+SSL_KEY_FILE = os.getenv("SLUICE_SSL_KEY_FILE")
+SSL_CERT_FILE = os.getenv("SLUICE_SSL_CERT_FILE")
 
 API_KEY = os.getenv("SLUICE_API_KEY")
 PORT = int(os.getenv("SLUICE_PORT", "8001"))
@@ -193,6 +204,10 @@ async def startup():
         try: ts_list = [float(x.strip()) for x in TENSOR_SPLIT.split(",")]
         except Exception: pass
 
+    # Task 7: Parse RoPE scaling
+    r_base = float(ROPE_FREQ_BASE) if ROPE_FREQ_BASE else None
+    r_scale = float(ROPE_FREQ_SCALE) if ROPE_FREQ_SCALE else None
+
     ENGINE = SluiceEngine(
         model_path=MODEL_PATH, 
         pools=POOLS,
@@ -207,7 +222,9 @@ async def startup():
         n_threads=N_THREADS,
         n_threads_batch=N_THREADS_BATCH,
         use_mlock=USE_MLOCK,
-        use_mmap=USE_MMAP
+        use_mmap=USE_MMAP,
+        rope_freq_base=r_base,
+        rope_freq_scale=r_scale
     )
 
     capacities = {p.name: p.max_tokens for p in POOLS}
@@ -288,7 +305,6 @@ def format_prompt(messages: List[ChatMessage], tools: Optional[List[Dict[str, An
     return p + "assistant: "
 
 def apply_sampling(c_ptr, m_ptr, last_tokens: List[int], request: ChatCompletionRequest, grammar: Optional[Any] = None):
-    # Construct candidates array
     logits = llama_cpp.llama_get_logits(c_ptr)
     n_vocab = llama_cpp.llama_n_vocab(m_ptr)
     candidates = (llama_cpp.llama_token_data * n_vocab)()
@@ -296,7 +312,6 @@ def apply_sampling(c_ptr, m_ptr, last_tokens: List[int], request: ChatCompletion
         candidates[i] = llama_cpp.llama_token_data(id=i, logit=logits[i], p=0.0)
     candidates_p = llama_cpp.llama_token_data_array(data=candidates, size=n_vocab, sorted=False)
     
-    # 1. Penalties
     if last_tokens:
         n_prev = min(len(last_tokens), 64)
         prev_array = (llama_cpp.llama_token * n_prev)(*last_tokens[-n_prev:])
@@ -308,11 +323,9 @@ def apply_sampling(c_ptr, m_ptr, last_tokens: List[int], request: ChatCompletion
             ctypes.c_float(request.frequency_penalty), ctypes.c_float(request.presence_penalty)
         )
 
-    # 2. Grammar
     if grammar:
         llama_cpp.llama_sample_grammar(c_ptr, ctypes.byref(candidates_p), grammar)
 
-    # 3. Sampling filters
     if request.temperature <= 0:
         ntid = llama_cpp.llama_sample_token_greedy(c_ptr, ctypes.byref(candidates_p))
     else:
@@ -472,7 +485,6 @@ async def chat_completions(request: ChatCompletionRequest, ctx_size: Optional[in
                 
                 for _ in range(request.max_tokens or DEFAULT_MAX_TOKENS):
                     async with execution_mutex:
-                        # Task 1/Fix: Return ntid and append to last_tokens
                         piece, ntid, finish = await loop.run_in_executor(None, low_level_stream_step, pool.name, sid, n_cur, last_tokens, request, grammar, allocation_size)
                     
                     if finish:
@@ -506,7 +518,8 @@ async def chat_completions(request: ChatCompletionRequest, ctx_size: Optional[in
         else:
             ENGINE.remove_sequence(pool.name, sid)
             await BANK.release(sid)
-        return ChatCompletionResponse(id=rid, created=int(time.time()), model=request.model, choices=[{"index": 0, "message": {"role": "assistant", "content": text}, "finish_reason": f_r}], usage={"prompt_tokens": n_p, "completion_tokens": n_g, "total_tokens": n_p + n_g})
+        # Task 6: Return MODEL_ALIAS
+        return ChatCompletionResponse(id=rid, created=int(time.time()), model=MODEL_ALIAS, choices=[{"index": 0, "message": {"role": "assistant", "content": text}, "finish_reason": f_r}], usage={"prompt_tokens": n_p, "completion_tokens": n_g, "total_tokens": n_p + n_g})
     except Exception as e:
         ENGINE.remove_sequence(pool.name, sid)
         await BANK.release(sid)
@@ -536,9 +549,24 @@ async def embeddings(request: EmbeddingRequest):
                 vec, n = await asyncio.get_event_loop().run_in_executor(None, proc, sid, tokens)
                 data.append({"object": "embedding", "index": idx, "embedding": vec})
                 total_p += n
-        return EmbeddingResponse(model=request.model, data=data, usage={"prompt_tokens": total_p, "total_tokens": total_p})
+        # Task 6: Return MODEL_ALIAS
+        return EmbeddingResponse(model=MODEL_ALIAS, data=data, usage={"prompt_tokens": total_p, "total_tokens": total_p})
     finally: await BANK.release(sid)
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host=HOST, port=PORT)
+    # Task 8: Optional SSL binding
+    uvicorn_kwargs = {
+        "app": app,
+        "host": HOST,
+        "port": PORT
+    }
+    if SSL_CERT_FILE and SSL_KEY_FILE:
+        if os.path.exists(SSL_CERT_FILE) and os.path.exists(SSL_KEY_FILE):
+            print(f"[SERVER] Starting with SSL support: {SSL_CERT_FILE}")
+            uvicorn_kwargs["ssl_keyfile"] = SSL_KEY_FILE
+            uvicorn_kwargs["ssl_certfile"] = SSL_CERT_FILE
+        else:
+            print(f"[WARNING] SSL files not found: {SSL_CERT_FILE} or {SSL_KEY_FILE}")
+            
+    uvicorn.run(**uvicorn_kwargs)
