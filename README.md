@@ -13,8 +13,11 @@ While optimized for multi-GPU setups (PCIe x16/x4), Sluice is **fully compatible
 ## 🚀 Key Features
 - **Shared Weight Pooling:** Load model weights into VRAM exactly once; share them across an infinite number of virtual context windows.
 - **Asymmetric Contexts:** Serve 2k, 32k, and 96k requests simultaneously from the same pool without VRAM duplication.
+- **Radix Prefix Caching:** Automatically deduplicate VRAM for shared system prompts or large context blocks using zero-copy cloning.
+- **Native Chat Templates:** Automatically detects and uses the model's native Jinja2 chat template from GGUF metadata for perfect prompt fidelity.
+- **Embeddings Support:** High-performance `/v1/embeddings` endpoint sharing the same model weights.
 - **Anti-Starvation Bank:** A custom `TokenBank` with barrier logic ensures that large coding tasks are never starved by a flood of smaller chat requests.
-- **Proxmox & Docker Native:** Includes first-class support for LXC GPU passthrough and CUDA-accelerated containers.
+- **Proxmox & Docker Native:** Optimized for unprivileged LXC containers and CUDA-accelerated Docker environments.
 - **Dynamic Auto-Elasticity:** Automatically grows the VRAM pool by scavenging resources (stopping SST/TTS) when a large request arrives, and shrinks back once idle.
 - **Tool Calling Support:** Full support for OpenAI-standard `tools` and `tool_choice` parameters.
 - **Optional Authentication:** Secure your server with a simple `SLUICE_API_KEY` Bearer Token.

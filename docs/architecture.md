@@ -14,5 +14,14 @@ Instead of separate contexts, Sluice uses **Sequence IDs** (`seq_id`) within the
 2. The KV cache is treated as a single "Token Reservoir."
 3. Each request is dynamically assigned a `seq_id` and a slice of the reservoir.
 
+### Radix Prefix Caching
+Sluice implements a high-performance **Radix Cache** that deduplicates VRAM for shared prefixes (like system prompts or large context files).
+- **Zero-Copy Cloning:** Uses `llama_memory_seq_cp` to instantly clone pre-filled tokens from a cached sequence to a new request.
+- **Throughput:** Near-zero "Time to First Token" for cached prompts.
+- **LRU Eviction:** Automatically manages cache size to stay within VRAM limits.
+
 ### PCIe Bottleneck Mitigation
 By using `split_mode: layer`, inter-GPU communication is minimized to token activation transfers. This bypasses the latency of Tensor Parallelism over narrow PCIe x4 channels typical in home-lab motherboard chipsets.
+
+### Native Template Fidelity
+Sluice extracts the `tokenizer.chat_template` directly from GGUF metadata. This ensures that the model (Qwen, Llama, Gemma, etc.) always sees the exact prompt format it was optimized for, reducing hallucinations and instruction-following errors.

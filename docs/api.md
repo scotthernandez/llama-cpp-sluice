@@ -7,43 +7,41 @@ The `llama-cpp-sluice` API is a high-performance, asynchronous gateway built on 
 ### 1. OpenAI Compatibility
 The server implements the standard `/v1/chat/completions` endpoint. This allows you to use standard libraries (Python `openai`, `LiteLLM`, `LangChain`) without modifying your client-side code.
 - **Streaming:** Full support for `stream: true` using Server-Sent Events (SSE).
+- **Tool Calling:** Supports `tools` and `tool_choice` for agentic workflows.
 
-### 2. Virtual Context URLs (Context-Aware Routing)
+### 2. Embeddings Support
+The `/v1/embeddings` endpoint provides OpenAI-compatible vector generation using the shared model weights.
+- Optimized for batch processing.
+- Dynamically gates VRAM usage via the Token Bank.
+
+### 3. Virtual Context URLs (Context-Aware Routing)
 Sluice supports encoding the required context size directly in the URL:
 - `POST /v1/ctx/2048/chat/completions` (Chat optimized)
 - `POST /v1/ctx/32768/chat/completions` (Coding optimized)
 
-### 3. Monitoring & Metrics
+### 4. Monitoring & Metrics
 The server exports Prometheus-compatible metrics at the `/metrics` endpoint:
-- `sluice_vram_used_tokens`: Real-time VRAM pool utilization.
-- `sluice_requests_waiting_large`: Number of large tasks in the priority queue.
-- `sluice_inference_latency_seconds`: Histogram of generation speeds.
-- `sluice_tokens_generated_total`: Cumulative throughput tracking.
+- `sluice_vram_used`: Currently used tokens in the pool.
+- `sluice_prefix_cache_hits`: Real-time tracking of deduplication efficiency.
+- `sluice_latency_seconds`: Histogram of generation speeds.
 
-### 3. Dynamic Barrier Gating
+### 5. Dynamic Barrier Gating
 The server uses an internal **Token Bank** to gate requests. 
-- **Wait Queues:** If the VRAM is full, requests are not immediately rejected. They "park" in an asynchronous wait queue for up to 60 seconds, providing a smoother user experience than hard errors.
+- **Wait Queues:** If the VRAM is full, requests "park" in an asynchronous wait queue.
 - **Anti-Starvation:** Large requests (coding) are prioritized over small requests (chat) when resources are tight.
 
 ## 🛠️ Administrative Endpoints
 
-The server provides a suite of `/v1/admin` tools for runtime infrastructure management:
-
 | Endpoint | Method | Description |
 | :--- | :--- | :--- |
-| `/v1/admin/drain` | `POST` | Gracefully stops accepting new requests while allowing active ones to finish. |
-| `/v1/admin/resume` | `POST` | Resumes accepting traffic after a drain or maintenance. |
-| `/v1/admin/defrag` | `POST` | Triggers a `llama_kv_cache_defrag` to compact used tokens and eliminate "holes" in VRAM. |
-| `/v1/admin/resize` | `POST` | Triggers a **Hot-Swap**: Drains the system and recreates the context with a new size (e.g., to reclaim VRAM for other models). |
+| `/v1/admin/drain` | `POST` | Gracefully stops accepting new requests. |
+| `/v1/admin/resume` | `POST` | Resumes accepting traffic. |
+| `/v1/admin/resize` | `POST` | Triggers a **Hot-Swap** to change the pool size at runtime. |
+| `/v1/admin/self-test` | `GET` | Runs a 'Golden Prompt' suite to verify model sanity and accuracy. |
 
 ## 📐 Technical Support
 
-- **AsyncIO Native:** The server handles all networking and state management asynchronously, ensuring high throughput even under heavy load.
-- **Threaded Inference:** CPU-bound `llama.cpp` calls are offloaded to a `ThreadPoolExecutor` to prevent blocking the main event loop.
-- **Pydantic Validation:** All request and response payloads are strictly validated using Pydantic v2, ensuring data integrity.
-- **Automatic Tokenizer Support:** The server automatically detects the tokenizer (BPE/SentencePiece) from the loaded `.gguf` file.
-
-## 🚦 Headers & Meta-Data
-In addition to JSON payloads, you can control the Sluice behavior via headers:
-- `X-Sluice-Required-Ctx`: Override the context size for a specific request.
-- Standard OpenAI headers (`Authorization`, `Content-Type`) are fully supported.
+- **AsyncIO Native:** Handles networking and state management asynchronously.
+- **Threaded Inference:** Offloads C++ inference to a `ThreadPoolExecutor`.
+- **Automatic Tokenizer Detection:** Reads BPE/SentencePiece settings directly from GGUF.
+- **Optional Bearer Auth:** Secure the API via `SLUICE_API_KEY`.
