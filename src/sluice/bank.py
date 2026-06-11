@@ -70,13 +70,23 @@ class TokenBank:
                     
                     # Manual timeout loop since asyncio.Condition.wait() has no timeout
                     try:
-                        await asyncio.wait_for(self.condition.wait(), timeout=1.0)
+                        await asyncio.wait_for(self.condition.wait(), timeout=min(1.0, timeout - elapsed))
                     except asyncio.TimeoutError:
                         continue
             except Exception:
                 if is_large and 'can_fit' in locals() and can_fit is False:
                     self.waiting_large -= 1
                 raise
+
+    def get_stats(self):
+        """Returns current bank utilization stats."""
+        return {
+            "used": self.used,
+            "total": self.total,
+            "waiting_large": self.waiting_large,
+            "is_expanded": self.is_expanded,
+            "is_draining": self.is_draining
+        }
 
     async def release(self, sid: int):
         async with self.condition:

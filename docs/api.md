@@ -6,13 +6,19 @@ The `llama-cpp-sluice` API is a high-performance, asynchronous gateway built on 
 
 ### 1. OpenAI Compatibility
 The server implements the standard `/v1/chat/completions` endpoint. This allows you to use standard libraries (Python `openai`, `LiteLLM`, `LangChain`) without modifying your client-side code.
+- **Streaming:** Full support for `stream: true` using Server-Sent Events (SSE).
 
 ### 2. Virtual Context URLs (Context-Aware Routing)
 Sluice supports encoding the required context size directly in the URL:
 - `POST /v1/ctx/2048/chat/completions` (Chat optimized)
 - `POST /v1/ctx/32768/chat/completions` (Coding optimized)
 
-This is the primary way to integrate with gateways like **new-api**, allowing the load-balancer to signal VRAM needs based on the requested model alias.
+### 3. Monitoring & Metrics
+The server exports Prometheus-compatible metrics at the `/metrics` endpoint:
+- `sluice_vram_used_tokens`: Real-time VRAM pool utilization.
+- `sluice_requests_waiting_large`: Number of large tasks in the priority queue.
+- `sluice_inference_latency_seconds`: Histogram of generation speeds.
+- `sluice_tokens_generated_total`: Cumulative throughput tracking.
 
 ### 3. Dynamic Barrier Gating
 The server uses an internal **Token Bank** to gate requests. 
