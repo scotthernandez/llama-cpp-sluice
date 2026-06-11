@@ -45,7 +45,7 @@ python -m sluice.server
 ```
 
 ## 📐 Architecture
-See the [Documentation](./docs/architecture.md) for a deep dive into the SWAMC pattern, the [Priority Lanes](./docs/priority-lanes.md) guide for details on the Anti-Starvation logic, and the [Concurrency Guide](./docs/concurrency.md) for technical details on locking.
+See the [Documentation](./docs/architecture.md) for a deep dive into the SWAMC pattern, the [Priority Lanes](./docs/priority-lanes.md) guide for details on the Anti-Starvation logic, the [Concurrency Guide](./docs/concurrency.md) for technical details on locking, and the [API Reference](./docs/api.md) for server capabilities.
 
 ## 📜 License
 Distributed under the MIT License. See `LICENSE` for more information.
