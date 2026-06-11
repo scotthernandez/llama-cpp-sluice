@@ -1,0 +1,17 @@
+[
+  {
+    "name": "Greedy Math",
+    "prompt": "2+2=",
+    "expected_regex": "4"
+  },
+  {
+    "name": "Python Boilerplate",
+    "prompt": "Write a python hello world function.",
+    "expected_regex": "def .*:.*print"
+  },
+  {
+    "name": "Model Identity",
+    "prompt": "Who are you?",
+    "expected_regex": "AI|assistant|model"
+  }
+]

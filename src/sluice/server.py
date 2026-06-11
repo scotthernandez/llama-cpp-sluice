@@ -161,6 +161,44 @@ async def admin_resize(new_size: int = Body(..., embed=True)):
     await BANK.resume()
     return {"status": "resized", "new_size": new_size}
 
+@app.get("/v1/admin/self-test", dependencies=[Depends(verify_auth)])
+async def admin_self_test():
+    """Runs a suite of 'Golden Prompts' to verify model sanity at runtime."""
+    import re
+    prompts_path = os.path.join(os.path.dirname(__file__), "self_test_prompts.json")
+    if not os.path.exists(prompts_path):
+        raise HTTPException(status_code=404, detail="Self-test prompts not found")
+        
+    with open(prompts_path, "r") as f:
+        tests = json.load(f)
+        
+    results = []
+    # Use a high-priority sid (1) for internal testing
+    try:
+        sid = await BANK.acquire(2048, timeout=30)
+    except TimeoutError:
+        return {"status": "error", "message": "Bank busy, could not run self-test"}
+
+    try:
+        loop = asyncio.get_event_loop()
+        for t in tests:
+            t0 = time.time()
+            text, _, _ = await loop.run_in_executor(None, low_level_generate, sid, t["prompt"], 32)
+            elapsed = time.time() - t0
+            
+            passed = bool(re.search(t["expected_regex"], text, re.IGNORECASE))
+            results.append({
+                "name": t["name"],
+                "passed": passed,
+                "latency_ms": elapsed * 1000,
+                "output_preview": text[:50]
+            })
+    finally:
+        llama_cpp.llama_memory_seq_rm(ENGINE.get_memory(), sid, -1, -1)
+        await BANK.release(sid)
+        
+    return {"status": "complete", "results": results}
+
 # --- Inference Core ---
 
 def format_prompt(messages: List[ChatMessage], tools: Optional[List[Dict[str, Any]]] = None) -> str:

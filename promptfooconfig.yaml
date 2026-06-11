@@ -1,0 +1,41 @@
+prompts:
+  - "Write a Python function to calculate the Fibonacci sequence."
+  - "What is the capital of France?"
+  - "Explain the concept of VRAM fragmentation in 50 words."
+  - "{{messages}}"
+
+providers:
+  - id: openai:chat:sluice
+    config:
+      api_base: http://localhost:8001/v1
+      api_key: unused
+
+tests:
+  - description: "Fibonacci function check"
+    vars:
+      messages:
+        - role: user
+          content: "Write a Python function to calculate Fibonacci."
+    assert:
+      - type: contains
+        value: "def fibonacci"
+      - type: contains
+        value: "return"
+
+  - description: "Fact check: France"
+    vars:
+      messages:
+        - role: user
+          content: "What is the capital of France?"
+    assert:
+      - type: contains
+        value: "Paris"
+
+  - description: "Technical conciseness check"
+    vars:
+      messages:
+        - role: user
+          content: "Explain VRAM fragmentation in 50 words."
+    assert:
+      - type: latency
+        threshold: 5000
