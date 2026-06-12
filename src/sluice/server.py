@@ -6,6 +6,7 @@ import uuid
 import json
 import re
 import argparse
+import sys
 from typing import Optional, List, Dict, Any, Generator, Union
 from fastapi import FastAPI, HTTPException, Body, Header, Path, Response, Depends
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -53,12 +54,9 @@ def parse_args():
     parser.add_argument("--pools", type=str, default=os.getenv("SLUICE_POOLS"), help="JSON string for complex multi-pool configurations")
     parser.add_argument("--no-adaptive-trimming", action="store_false", dest="trimming", default=os.getenv("SLUICE_ENABLE_ADAPTIVE_TRIMMING", "true").lower() == "true", help="Disable middle-out context trimming")
 
-    # If being run by pytest or other tools, don't parse sys.argv
     if "pytest" in sys.modules or os.getenv("PYTEST_CURRENT_TEST"):
         return parser.parse_args([])
     return parser.parse_args()
-
-import sys # Needed for sys.modules check above
 
 ARGS = parse_args()
 
@@ -162,6 +160,7 @@ TRIMMER: Optional[MiddleOutTrimmer] = None
 async def maintenance_loop():
     while True:
         await asyncio.sleep(ELASTICITY_INTERVAL)
+        if not BANK or not ENGINE: continue
         stats = BANK.get_stats()
         for name in BANK.pool_names:
             METRIC_POOL_USED.labels(pool=name).set(stats["used"][name])
@@ -267,6 +266,20 @@ async def startup():
 @app.get("/metrics", dependencies=[Depends(verify_auth)])
 async def metrics(): return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
+@app.get("/v1/models", dependencies=[Depends(verify_auth)])
+async def list_models():
+    return {
+        "object": "list",
+        "data": [
+            {
+                "id": MODEL_ALIAS,
+                "object": "model",
+                "created": int(time.time()),
+                "owned_by": "sluice"
+            }
+        ]
+    }
+
 @app.post("/v1/admin/drain", dependencies=[Depends(verify_auth)])
 async def admin_drain():
     asyncio.create_task(BANK.drain())
@@ -327,15 +340,18 @@ def format_prompt(messages: List[ChatMessage], tools: Optional[List[Dict[str, An
     if t_str:
         try:
             from jinja2 import Template
-            return Template(t_str).render(messages=[m.dict(exclude_none=True) for m in messages], tools=tools, add_generation_prompt=True)
-        except Exception: pass
+            msgs_list = [m.model_dump(exclude_none=True) for m in messages]
+            prompt = Template(t_str).render(messages=msgs_list, tools=tools, add_generation_prompt=True)
+            return prompt
+        except Exception as e:
+            print(f"[WARNING] Jinja render failed: {e}. Falling back to simple format.")
     p = ""
     for m in messages:
         if m.content: p += f"{m.role}: {m.content}\n"
     return p + "assistant: "
 
-def apply_sampling(c_ptr, m_ptr, last_tokens: List[int], request: ChatCompletionRequest, grammar: Optional[Any] = None):
-    logits = llama_cpp.llama_get_logits(c_ptr)
+def apply_sampling(c_ptr, m_ptr, last_tokens: List[int], request: ChatCompletionRequest, grammar: Optional[Any] = None, batch_idx: int = 0):
+    logits = llama_cpp.llama_get_logits_ith(c_ptr, batch_idx)
     n_vocab = llama_cpp.llama_n_vocab(m_ptr)
     candidates = (llama_cpp.llama_token_data * n_vocab)()
     for i in range(n_vocab):
@@ -400,7 +416,7 @@ def low_level_generate(pool: str, sid: int, tokens: List[int], max_tokens: int, 
                 finish_reason = "length"
                 break
             
-            ntid = apply_sampling(c_ptr, m_ptr, last_tokens, request, grammar)
+            ntid = apply_sampling(c_ptr, m_ptr, last_tokens, request, grammar, batch_idx=batch.n_tokens - 1)
             if ntid == llama_cpp.llama_token_eos(m_ptr): break
             
             buf = ctypes.create_string_buffer(128)
@@ -438,7 +454,7 @@ def low_level_stream_step(pool: str, sid: int, n_cur: int, last_tokens: List[int
     m_ptr, c_ptr = ENGINE.get_model_ptr(), ENGINE.get_context_ptr(pool)
     if budget > 0 and (n_cur + 1) >= budget: return None, 0, "length"
     
-    ntid = apply_sampling(c_ptr, m_ptr, last_tokens, request, grammar)
+    ntid = apply_sampling(c_ptr, m_ptr, last_tokens, request, grammar, batch_idx=0)
     if ntid == llama_cpp.llama_token_eos(m_ptr): return None, ntid, "stop"
     
     buf = ctypes.create_string_buffer(128)
@@ -566,11 +582,12 @@ async def embeddings(request: EmbeddingRequest):
             for idx, text in enumerate(inputs):
                 tokens = get_tokens(text)
                 def proc(s, tks):
+                    c_ptr = ENGINE.get_context_ptr(pool_name)
                     batch = llama_cpp.llama_batch_init(len(tks), 0, 1)
                     try:
                         for i in range(len(tks)): batch.token[i], batch.pos[i], batch.n_seq_id[i], batch.seq_id[i][0], batch.logits[i] = tks[i], i, 1, s, False
                         batch.n_tokens = len(tks)
-                        if llama_cpp.llama_decode(ENGINE.get_context_ptr(pool_name), batch) != 0: raise RuntimeError("Decode fail")
+                        if llama_cpp.llama_decode(c_ptr, batch) != 0: raise RuntimeError("Decode fail")
                         return ENGINE.get_embeddings(pool_name, s), len(tks)
                     finally:
                         llama_cpp.llama_batch_free(batch)
@@ -581,7 +598,7 @@ async def embeddings(request: EmbeddingRequest):
         return EmbeddingResponse(model=MODEL_ALIAS, data=data, usage={"prompt_tokens": total_p, "total_tokens": total_p})
     finally: await BANK.release(sid)
 
-if __name__ == "__main__":
+def main():
     import uvicorn
     uvicorn_kwargs = {
         "app": app,
@@ -595,3 +612,6 @@ if __name__ == "__main__":
             uvicorn_kwargs["ssl_certfile"] = ARGS.ssl_cert_file
             
     uvicorn.run(**uvicorn_kwargs)
+
+if __name__ == "__main__":
+    main()
