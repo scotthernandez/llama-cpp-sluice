@@ -68,6 +68,31 @@ TRIMMER: Optional[MiddleOutTrimmer] = None
 SHUTDOWN_EVENT = threading.Event()
 
 # Hardware execution executor (Properly serializes C-level inference to a single background thread)
+# Inference is serialized to a single worker.  Every code path that calls
+# llama_decode / llama_sampler_sample acquires this lock before proceeding,
+# so at most one sequence generates at any moment (prefill + full decode
+# loop run atomically).
+#
+# Why serialisation is intentional:
+#
+#   * Prevents starvation — the TokenBank's anti-starvation bank reserves
+#     VRAM for large requests; without serialisation a flood of tiny
+#     requests could starve them.
+#   * Eliminates latency spikes — concurrent multi-sequence decoding on the
+#     same context causes KV-cache contention and non-deterministic decode
+#     ordering, which spikes latency unpredictably.
+#   * Avoids C-level crashes — the underlying llama.cpp C API does not
+#     support true concurrent multi-sequence decoding on the same context
+#     pointer.  Calling llama_decode from multiple OS threads can trigger
+#     SIGSEGV or silent KV-cache corruption.
+#
+# Configuration note:
+#
+#   ``cparams.n_seq_max = 16`` (engine.py, line 125) advertises capacity for
+#   up to 16 concurrent sequences, but the executor effectively limits live
+#   inference to 1 sequence.  Users should not interpret 16 as "16 parallel
+#   generations."  True concurrency would require a multi-engine /
+#   multi-context deployment, which is not currently implemented.
 llm_executor = ThreadPoolExecutor(max_workers=1)
 
 def signal_handler(sig, frame):
