@@ -59,19 +59,20 @@ ARGS = parse_args()
 RESERVED_POOL = ARGS.reserved_pool if ARGS.reserved_pool is not None else (ARGS.ctx_size // 4)
 LARGE_THRESHOLD = ARGS.large_threshold if ARGS.large_threshold is not None else (ARGS.ctx_size // 2)
 
+from concurrent.futures import ThreadPoolExecutor
+
 # --- Globals ---
 engine: Optional[SluiceEngine] = None
 BANK: Optional[TokenBank] = None
 TRIMMER: Optional[MiddleOutTrimmer] = None
-SHUTTING_DOWN = False
+SHUTDOWN_EVENT = threading.Event()
 
-# Hardware execution lock (Prevents C-level SIGSEGV during concurrent retry)
-llm_lock = threading.Lock()
+# Hardware execution executor (Properly serializes C-level inference to a single background thread)
+llm_executor = ThreadPoolExecutor(max_workers=1)
 
 def signal_handler(sig, frame):
-    global SHUTTING_DOWN
     print(f"\n[SLUICE] Signal {sig} received. Starting graceful shutdown...")
-    SHUTTING_DOWN = True
+    SHUTDOWN_EVENT.set()
 
 signal.signal(signal.SIGINT, signal_handler)
 signal.signal(signal.SIGTERM, signal_handler)
@@ -125,11 +126,12 @@ async def startup():
 
 @app.on_event("shutdown")
 async def shutdown():
-    global engine, BANK, SHUTTING_DOWN
-    SHUTTING_DOWN = True
+    global engine, BANK
+    SHUTDOWN_EVENT.set()
     print("[SLUICE] Shutting down gateway...")
     if BANK:
         await BANK.drain()
+    llm_executor.shutdown(wait=True)
     if engine:
         del engine
     print("[SLUICE] Gateway offline.")
@@ -253,7 +255,6 @@ async def list_models():
     return {"object": "list", "data": [{"id": ARGS.alias, "object": "model", "created": int(time.time()), "owned_by": "sluice"}]}
 
 def low_level_generate(sid: int, tokens: List[int], max_tokens: int, budget: int, request: ChatCompletionRequest):
-    global SHUTTING_DOWN
     m_ptr, c_ptr = engine.get_model_ptr(), engine.get_context_ptr()
     n_tokens = len(tokens)
     batch = llama_cpp.llama_batch_init(ARGS.batch_size, 0, 1)
@@ -278,7 +279,7 @@ def low_level_generate(sid: int, tokens: List[int], max_tokens: int, budget: int
         n_cur, finish_reason = n_tokens, "stop"
         
         for i in range(max_tokens):
-            if SHUTTING_DOWN:
+            if SHUTDOWN_EVENT.is_set():
                 finish_reason = "shutdown"
                 break
             if (n_cur + 1) >= budget:
@@ -330,8 +331,7 @@ def low_level_stream_start(sid: int, tokens: List[int], request: ChatCompletionR
     return n_tokens, ntid
 
 def low_level_stream_step(sid: int, n_cur: int, last_tokens: List[int], request: ChatCompletionRequest, budget: int, prev_ntid: int):
-    global SHUTTING_DOWN
-    if SHUTTING_DOWN: return None, None, "shutdown"
+    if SHUTDOWN_EVENT.is_set(): return None, None, "shutdown"
     m_ptr, c_ptr = engine.get_model_ptr(), engine.get_context_ptr()
     if (n_cur + 1) >= budget: return None, None, "length"
     
@@ -372,8 +372,9 @@ async def chat_completions(request: ChatCompletionRequest):
         else:
             return Response(json.dumps({"error": {"message": f"VRAM Full. Need {needed}, avail {available}"}}), status_code=429, headers={"Retry-After": "5"})
 
-    sid = await BANK.acquire(needed)
+    sid = None
     try:
+        sid = await BANK.acquire(needed)
         if request.stream:
             async def stream_gen():
                 last_tokens = list(tokens)
@@ -381,17 +382,15 @@ async def chat_completions(request: ChatCompletionRequest):
                     loop = asyncio.get_event_loop()
                     
                     def start():
-                        with llm_lock:
-                            return low_level_stream_start(sid, tokens, request)
+                        return low_level_stream_start(sid, tokens, request)
                             
-                    n_cur, prev_ntid = await loop.run_in_executor(None, start)
+                    n_cur, prev_ntid = await loop.run_in_executor(llm_executor, start)
                     
                     for _ in range(request.max_tokens):
                         def step():
-                            with llm_lock:
-                                return low_level_stream_step(sid, n_cur, last_tokens, request, needed, prev_ntid)
+                            return low_level_stream_step(sid, n_cur, last_tokens, request, needed, prev_ntid)
                         
-                        piece, ntid, finish = await loop.run_in_executor(None, step)
+                        piece, ntid, finish = await loop.run_in_executor(llm_executor, step)
                         
                         if finish:
                             yield f"data: {json.dumps({'id': rid, 'choices': [{'index': 0, 'delta': {}, 'finish_reason': finish}], 'model': ARGS.alias})}\n\n"
@@ -406,17 +405,18 @@ async def chat_completions(request: ChatCompletionRequest):
                     print(f"[STREAM ERROR] {stream_e}")
                     yield f"data: {json.dumps({'error': str(stream_e)})}\n\n"
                 finally:
-                    with llm_lock:
-                        engine.remove_sequence(sid)
-                    await BANK.release(sid)
+                    if sid is not None:
+                        def cleanup():
+                            engine.remove_sequence(sid)
+                        await asyncio.get_event_loop().run_in_executor(llm_executor, cleanup)
+                        await BANK.release(sid)
             return StreamingResponse(stream_gen(), media_type="text/event-stream")
 
         loop = asyncio.get_event_loop()
         def run():
-            with llm_lock:
-                return low_level_generate(sid, tokens, request.max_tokens, needed, request)
+            return low_level_generate(sid, tokens, request.max_tokens, needed, request)
 
-        text, n_p, n_g, f_r = await loop.run_in_executor(None, run)
+        text, n_p, n_g, f_r = await loop.run_in_executor(llm_executor, run)
         return {
             "id": rid,
             "object": "chat.completion",
@@ -429,15 +429,12 @@ async def chat_completions(request: ChatCompletionRequest):
         print(f"[ERROR] Chat completions failed: {e}")
         if isinstance(e, BankSaturated):
             return Response(json.dumps({"error": {"message": str(e)}}), status_code=429, headers={"Retry-After": "5"})
-        if 'sid' in locals():
-            with llm_lock:
-                engine.remove_sequence(sid)
-            await BANK.release(sid)
         raise HTTPException(status_code=500, detail=str(e))
     finally:
-        if 'sid' in locals() and not request.stream:
-            with llm_lock:
+        if sid is not None and not request.stream:
+            def cleanup():
                 engine.remove_sequence(sid)
+            await asyncio.get_event_loop().run_in_executor(llm_executor, cleanup)
             await BANK.release(sid)
 
 @app.post("/v1/embeddings", dependencies=[Depends(verify_auth)])
@@ -449,8 +446,9 @@ async def embeddings(request: EmbeddingRequest):
     for idx, text in enumerate(inputs):
         tokens = get_tokens(text)
         total_p += len(tokens)
-        sid = await BANK.acquire(len(tokens))
+        sid = None
         try:
+            sid = await BANK.acquire(len(tokens))
             m_ptr, c_ptr = engine.get_model_ptr(), engine.get_context_ptr()
             batch = llama_cpp.llama_batch_init(len(tokens), 0, 1)
             try:
@@ -458,18 +456,21 @@ async def embeddings(request: EmbeddingRequest):
                 for i in range(len(tokens)):
                     batch.token[i], batch.pos[i], batch.n_seq_id[i], batch.seq_id[i][0], batch.logits[i] = tokens[i], i, 1, sid, False
                 
-                with llm_lock:
+                def decode():
                     if llama_cpp.llama_decode(c_ptr, batch) != 0:
                         raise RuntimeError("Embedding decode fail")
-                    vec = engine.get_embeddings(sid)
+                    return engine.get_embeddings(sid)
                 
+                vec = await asyncio.get_event_loop().run_in_executor(llm_executor, decode)
                 data.append({"object": "embedding", "index": idx, "embedding": vec})
             finally:
                 llama_cpp.llama_batch_free(batch)
         finally:
-            with llm_lock:
-                engine.remove_sequence(sid)
-            await BANK.release(sid)
+            if sid is not None:
+                def cleanup():
+                    engine.remove_sequence(sid)
+                await asyncio.get_event_loop().run_in_executor(llm_executor, cleanup)
+                await BANK.release(sid)
             
     return {
         "object": "list",
