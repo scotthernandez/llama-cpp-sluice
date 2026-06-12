@@ -34,6 +34,7 @@ class TokenBank:
         self.waiting_large = 0
         self.is_draining = False
         self.is_expanded = False
+        self._scavenge_triggered: Dict[int, float] = {}
 
     async def acquire(self, requested_size: int, timeout: float = 60.0) -> int:
         is_large = requested_size >= self.large_threshold
@@ -42,6 +43,7 @@ class TokenBank:
 
         while True:
             trigger_scavenge = False
+            sid = None
             async with self.condition:
                 if self.is_draining: raise RuntimeError("Server is currently draining.")
                 if is_large and not hook_triggered: # Only increment once if we loop
@@ -64,7 +66,8 @@ class TokenBank:
                         return sid
 
                     elapsed = time.time() - start_time
-                    if is_large and self.starvation_hook and elapsed > self.scavenge_delay and not trigger_scavenge:
+                    if is_large and self.starvation_hook and elapsed > self.scavenge_delay and sid not in self._scavenge_triggered:
+                        self._scavenge_triggered[sid] = time.time()
                         trigger_scavenge = True
 
                     if elapsed > timeout:
@@ -74,7 +77,7 @@ class TokenBank:
                     
                     try: await asyncio.wait_for(self.condition.wait(), timeout=min(1.0, timeout - elapsed))
                     except asyncio.TimeoutError: pass
-                except BaseException:
+                except Exception:
                     if is_large: self.waiting_large -= 1
                     raise
             
