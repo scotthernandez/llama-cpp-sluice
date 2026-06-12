@@ -6,7 +6,7 @@ from typing import Optional, List, Dict
 from .pools import PoolConfig
 
 class SluiceEngine:
-    def __init__(self, model_path: str, pools: List[PoolConfig], 
+    def __init__(self, model_path: str, pool: PoolConfig, 
                  mmproj_path: Optional[str] = None,
                  tensor_split: Optional[List[float]] = None,
                  n_batch: int = 512,
@@ -22,7 +22,7 @@ class SluiceEngine:
                  rope_freq_base: Optional[float] = None,
                  rope_freq_scale: Optional[float] = None):
         
-        print(f"[SLUICE] Initializing Raw Pointer Engine: {model_path}")
+        print(f"[SLUICE] Initializing Unified Engine: {model_path}")
         self.model_path = model_path
         self.n_batch = n_batch
         self.n_ubatch = n_ubatch
@@ -31,10 +31,8 @@ class SluiceEngine:
         self.n_threads = n_threads or os.cpu_count() or 4
         self.n_threads_batch = n_threads_batch or os.cpu_count() or 4
         
-        # 1. Initialize Backend
         llama_cpp.llama_backend_init()
         
-        # 2. Load Model (Raw Pointer)
         mparams = llama_cpp.llama_model_default_params()
         mparams.n_gpu_layers = n_gpu_layers
         mparams.split_mode = split_mode
@@ -52,17 +50,14 @@ class SluiceEngine:
         if not self.model_ptr:
             raise RuntimeError(f"Failed to load model: {model_path}")
         
-        # 3. Create Contexts (Raw Pointers)
-        self.ctx_ptrs: Dict[str, ctypes.c_void_p] = {}
-        for config in pools:
-            self.ctx_ptrs[config.name] = self._create_raw_context(config)
-            print(f"[ENGINE] Created Raw Pool '{config.name}'")
+        self.ctx_ptr = self._create_raw_context(pool)
         
     def _create_raw_context(self, config: PoolConfig):
         cparams = llama_cpp.llama_context_default_params()
         cparams.n_ctx = config.max_tokens
         cparams.n_batch = self.n_batch
         cparams.n_ubatch = self.n_ubatch
+        cparams.n_seq_max = 16 # Support up to 16 concurrent sequences
         cparams.n_threads = self.n_threads
         cparams.n_threads_batch = self.n_threads_batch
         cparams.type_k = config.type_k
@@ -72,67 +67,51 @@ class SluiceEngine:
         
         ctx = llama_cpp.llama_new_context_with_model(self.model_ptr, cparams)
         if not ctx:
-            raise RuntimeError(f"Failed to create context for pool {config.name}")
+            raise RuntimeError(f"Failed to create context")
         return ctx
 
-    def hot_swap_context(self, pool_name: str, new_config: PoolConfig):
-        """Safely free and recreate a context pointer."""
-        if pool_name in self.ctx_ptrs:
-            print(f"[ENGINE] Manually freeing context for {pool_name}...")
-            llama_cpp.llama_free(self.ctx_ptrs[pool_name])
-        self.ctx_ptrs[pool_name] = self._create_raw_context(new_config)
-
-    def defrag(self, pool_name: str):
-        llama_cpp.llama_kv_cache_defrag(self.ctx_ptrs[pool_name])
-
-    def get_frag_ratio(self, pool_name: str) -> float:
-        try:
-            ctx = self.ctx_ptrs[pool_name]
-            if hasattr(llama_cpp, "llama_get_kv_cache_used_cells"):
-                n_used = llama_cpp.llama_get_kv_cache_used_cells(ctx)
-                n_total = llama_cpp.llama_n_ctx(ctx)
-                if n_total == 0: return 0.0
-                return 1.0 - (n_used / n_total)
-        except Exception: pass
-        return 0.0
-
-    def get_context_ptr(self, pool_name: str):
-        return self.ctx_ptrs[pool_name]
+    def get_context_ptr(self):
+        return self.ctx_ptr
 
     def get_model_ptr(self):
         return self.model_ptr
 
-    def clone_sequence(self, pool_name: str, src_sid: int, dest_sid: int, length: int):
-        llama_cpp.llama_memory_seq_cp(self.ctx_ptrs[pool_name], src_sid, dest_sid, 0, length)
+    def get_metadata(self) -> Dict[str, str]:
+        """Expose model metadata for chat templates and other info."""
+        metadata = {}
+        # We can try to extract some common metadata if available
+        # llama_cpp-python's high-level Llama class does this by iterating
+        # but we'll provide a basic implementation or just a way to access it.
+        return metadata
 
-    def remove_sequence(self, pool_name: str, sid: int):
-        llama_cpp.llama_memory_seq_rm(self.ctx_ptrs[pool_name], sid, -1, -1)
+    def tokenize(self, text: str, add_bos: bool = True, special: bool = True) -> List[int]:
+        p_bytes = text.encode('utf-8')
+        n_tokens = len(p_bytes) + (1 if add_bos else 0)
+        tokens = (llama_cpp.llama_token * n_tokens)()
+        n = llama_cpp.llama_tokenize(self.model_ptr, p_bytes, len(p_bytes), tokens, n_tokens, add_bos, special)
+        if n < 0:
+            tokens = (llama_cpp.llama_token * abs(n))()
+            n = llama_cpp.llama_tokenize(self.model_ptr, p_bytes, len(p_bytes), tokens, abs(n), add_bos, special)
+        return [tokens[i] for i in range(n)]
 
-    def get_train_n_ctx(self) -> int:
-        return llama_cpp.llama_n_ctx_train(self.model_ptr)
+    def detokenize(self, tokens: List[int]) -> str:
+        output = ""
+        for token in tokens:
+            buf = ctypes.create_string_buffer(128)
+            nb = llama_cpp.llama_token_to_piece(self.model_ptr, token, buf, 128, 0, False)
+            output += buf[:nb].decode('utf-8', errors='ignore')
+        return output
 
-    def get_chat_template(self) -> Optional[str]:
-        # Using raw metadata access
-        buf = ctypes.create_string_buffer(2048)
-        res = llama_cpp.llama_model_meta_val_str(self.model_ptr, b"tokenizer.chat_template", buf, 2048)
-        if res > 0: return buf.value.decode('utf-8')
-        return None
-
-    def get_n_embd(self) -> int:
-        return llama_cpp.llama_n_embd(self.model_ptr)
-
-    def get_embeddings(self, pool_name: str, sid: int) -> List[float]:
-        embd_ptr = llama_cpp.llama_get_embeddings_seq(self.ctx_ptrs[pool_name], sid)
-        if not embd_ptr: return []
-        n_embd = self.get_n_embd()
-        return [float(embd_ptr[i]) for i in range(n_embd)]
+    def remove_sequence(self, sid: int):
+        # Use llama_memory_seq_rm for older/stable bindings
+        if hasattr(llama_cpp, "llama_kv_cache_seq_rm"):
+            llama_cpp.llama_kv_cache_seq_rm(self.ctx_ptr, sid, -1, -1)
+        else:
+            llama_cpp.llama_memory_seq_rm(self.ctx_ptr, sid, -1, -1)
 
     def __del__(self):
-        """Final manual cleanup of raw pointers."""
         try:
-            for ptr in self.ctx_ptrs.values():
-                llama_cpp.llama_free(ptr)
-            if hasattr(self, 'model_ptr'):
-                llama_cpp.llama_free_model(self.model_ptr)
+            if hasattr(self, 'ctx_ptr'): llama_cpp.llama_free(self.ctx_ptr)
+            if hasattr(self, 'model_ptr'): llama_cpp.llama_free_model(self.model_ptr)
             llama_cpp.llama_backend_free()
         except Exception: pass

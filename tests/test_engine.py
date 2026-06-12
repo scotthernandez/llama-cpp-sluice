@@ -7,16 +7,10 @@ import sys
 def test_engine_init():
     # llama_cpp is mocked in conftest
     import llama_cpp._internals
-    pools = [PoolConfig(name="p", max_tokens=100)]
-    engine = SluiceEngine("fake.gguf", pools)
+    pool = PoolConfig(name="p", max_tokens=100)
+    engine = SluiceEngine("fake.gguf", pool)
     assert engine.model_path == "fake.gguf"
-    assert "p" in engine.contexts
+    assert hasattr(engine, 'ctx_ptr')
 
 def test_engine_hot_swap():
-    import llama_cpp._internals
-    pools = [PoolConfig(name="p", max_tokens=100)]
-    engine = SluiceEngine("fake.gguf", pools)
-    
-    new_c = PoolConfig(name="p", max_tokens=200)
-    engine.hot_swap_context("p", new_c)
-    assert "p" in engine.contexts
+    pass # engine_hot_swap was removed

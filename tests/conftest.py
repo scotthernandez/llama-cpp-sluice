@@ -26,14 +26,14 @@ import sluice.server
 from sluice.pools import PoolConfig
 
 # 4. Initialize globals for server tests
-sluice.server.ENGINE = MagicMock()
-sluice.server.ENGINE.get_model_ptr.return_value = MagicMock()
-sluice.server.ENGINE.get_context_ptr.return_value = MagicMock()
-sluice.server.ENGINE.get_chat_template.return_value = None
-sluice.server.ENGINE.get_train_n_ctx.return_value = 32768
-sluice.server.ENGINE.get_n_embd.return_value = 128
-sluice.server.ENGINE.get_embeddings.return_value = [0.1] * 128
-sluice.server.ENGINE.get_frag_ratio.return_value = 0.0
+sluice.server.engine = MagicMock()
+sluice.server.engine.get_model_ptr.return_value = MagicMock()
+sluice.server.engine.get_context_ptr.return_value = MagicMock()
+sluice.server.engine.get_chat_template.return_value = None
+sluice.server.engine.get_train_n_ctx.return_value = 32768
+sluice.server.engine.get_n_embd.return_value = 128
+sluice.server.engine.get_embeddings.return_value = [0.1] * 128
+sluice.server.engine.get_frag_ratio.return_value = 0.0
 
 # Provide pools that actually work with the barrier
 TEST_POOLS = [
@@ -45,19 +45,19 @@ sluice.server.BASE_POOL = TEST_POOLS[0].max_tokens
 sluice.server.LARGE_THRESHOLD = 16384
 sluice.server.RESERVED_POOL = 1000 # Small reserve for tests
 
-capacities = {p.name: p.max_tokens for p in TEST_POOLS}
-sluice.server.BANK = sluice.bank.TokenBank(list(capacities.keys()), capacities, 1000)
+sluice.server.BANK = sluice.bank.TokenBank(100000, 1000)
 
 import pytest
 
 @pytest.fixture(autouse=True)
 def clean_bank_fixture():
     bank = sluice.server.BANK
-    bank.used = {name: 0 for name in bank.pool_names}
+    bank.used = 0
     bank.active_seqs = {}
     bank.pinned_seqs = {}
+    bank.available_sids = list(range(16))
     bank.waiting_large = 0
     bank.is_draining = False
     bank.is_expanded = False
-    bank.capacities = {"precision": 100000, "efficiency": 100000}
+    bank.capacity = 100000
     yield bank

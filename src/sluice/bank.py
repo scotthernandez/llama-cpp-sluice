@@ -1,120 +1,131 @@
 import asyncio
 import time
 import subprocess
+import logging
 from typing import Dict, Optional, List, Any
+
+# Configure logger
+logger = logging.getLogger("sluice.bank")
 
 class BankSaturated(Exception):
     """Raised when a request cannot be satisfied within the timeout."""
     pass
 
 class TokenBank:
-    def __init__(self, pool_names: List[str], pool_capacities: Dict[str, int], reserved_for_large: int, 
+    def __init__(self, capacity: int, reserved_for_large: int, 
                  large_threshold: int = 16384, 
                  starvation_hook: Optional[str] = None, 
                  recovery_hook: Optional[str] = None,
-                 scavenge_delay: float = 15.0):
-        self.pool_names = pool_names
-        self.capacities = pool_capacities
-        self.used = {name: 0 for name in pool_names}
+                 scavenge_delay: float = 15.0,
+                 max_sequences: int = 16):
+        self.capacity = capacity
+        self.used = 0
         self.reserved_for_large = reserved_for_large
         self.large_threshold = large_threshold
         self.starvation_hook = starvation_hook
         self.recovery_hook = recovery_hook
         self.scavenge_delay = scavenge_delay
         
-        self.active_seqs: Dict[int, Dict[str, Any]] = {} 
-        self.pinned_seqs: Dict[int, Dict[str, Any]] = {} 
-        self.seq_counter = 0
+        self.active_seqs: Dict[int, int] = {} # sid -> size
+        self.pinned_seqs: Dict[int, int] = {} 
+        self.available_sids = list(range(max_sequences))
         self.lock = asyncio.Lock()
         self.condition = asyncio.Condition(self.lock)
         self.waiting_large = 0
         self.is_draining = False
         self.is_expanded = False
 
-    async def acquire(self, pool_name: str, requested_size: int, timeout: float = 60.0) -> int:
+    async def acquire(self, requested_size: int, timeout: float = 60.0) -> int:
         is_large = requested_size >= self.large_threshold
         start_time = time.time()
         hook_triggered = False
 
-        async with self.condition:
-            if self.is_draining: raise RuntimeError("Server is currently draining.")
-            if is_large: self.waiting_large += 1
-            
-            try:
-                while True:
-                    available = self.capacities[pool_name] - self.used[pool_name]
+        while True:
+            trigger_scavenge = False
+            async with self.condition:
+                if self.is_draining: raise RuntimeError("Server is currently draining.")
+                if is_large and not hook_triggered: # Only increment once if we loop
+                    self.waiting_large += 1
+                    hook_triggered = True # Using this to track the increment too
+                
+                try:
+                    available = self.capacity - self.used
                     
                     if not is_large and (self.waiting_large > 0 or (available - requested_size) < self.reserved_for_large):
                         can_fit = False
                     else:
-                        can_fit = requested_size <= available
+                        can_fit = requested_size <= available and len(self.available_sids) > 0
 
                     if can_fit:
                         if is_large: self.waiting_large -= 1
-                        self.seq_counter += 1
-                        sid = self.seq_counter
-                        self.used[pool_name] += requested_size
-                        self.active_seqs[sid] = {"pool": pool_name, "size": requested_size}
+                        sid = self.available_sids.pop(0)
+                        self.used += requested_size
+                        self.active_seqs[sid] = requested_size
                         return sid
 
                     elapsed = time.time() - start_time
-                    if is_large and self.starvation_hook and elapsed > self.scavenge_delay and not hook_triggered:
-                        asyncio.create_task(self._run_hook(self.starvation_hook, "Scavenge"))
-                        hook_triggered = True
+                    if is_large and self.starvation_hook and elapsed > self.scavenge_delay and not trigger_scavenge:
+                        trigger_scavenge = True
 
                     if elapsed > timeout:
                         if is_large: self.waiting_large -= 1
-                        raise BankSaturated(f"Bank saturated: Needed {requested_size} in {pool_name}")
+                        reason = "Bank saturated" if requested_size > available else "No sequence IDs available"
+                        raise BankSaturated(f"{reason}: Needed {requested_size}")
                     
                     try: await asyncio.wait_for(self.condition.wait(), timeout=min(1.0, timeout - elapsed))
-                    except asyncio.TimeoutError: continue
-            except Exception:
-                if is_large and 'can_fit' in locals() and can_fit is False: self.waiting_large -= 1
-                raise
+                    except asyncio.TimeoutError: pass
+                except BaseException:
+                    if is_large: self.waiting_large -= 1
+                    raise
+            
+            # Execute hook outside of condition lock
+            if trigger_scavenge:
+                asyncio.create_task(self._run_hook(self.starvation_hook, "Scavenge"))
 
-    def get_available_for_large(self, pool_name: str) -> int:
-        return self.capacities[pool_name] - self.used[pool_name]
+    def get_available_for_large(self) -> int:
+        return self.capacity - self.used
 
-    def get_available_for_small(self, pool_name: str) -> int:
-        available = self.capacities[pool_name] - self.used[pool_name]
-        return max(0, available - self.reserved_for_large)
+    def get_available_for_small(self) -> int:
+        return max(0, self.capacity - self.used - self.reserved_for_large)
 
     async def release(self, sid: int, pin: bool = False):
         async with self.condition:
-            data = self.active_seqs.pop(sid, None)
-            if not data: return
-            pool, size = data["pool"], data["size"]
-            if pin: self.pinned_seqs[sid] = data
-            else: self.used[pool] -= size
+            size = self.active_seqs.pop(sid, None)
+            if size is None: return
+            if pin: self.pinned_seqs[sid] = size
+            else: 
+                self.used -= size
+                self.available_sids.append(sid)
             self.condition.notify_all()
 
     async def evict(self, sid: int):
         async with self.condition:
-            data = self.pinned_seqs.pop(sid, None)
-            if not data: return
-            self.used[data["pool"]] -= data["size"]
+            size = self.pinned_seqs.pop(sid, None)
+            if size is None: return
+            self.used -= size
+            self.available_sids.append(sid)
             self.condition.notify_all()
 
     async def drain(self):
         async with self.condition:
             self.is_draining = True
-            while sum(self.used.values()) > 0: await self.condition.wait()
+            while self.used > 0: await self.condition.wait()
 
     async def resume(self):
         async with self.condition:
             self.is_draining = False
             self.condition.notify_all()
 
-    async def update_capacity(self, pool_name: str, new_total: int, expanded: bool):
+    async def update_capacity(self, new_total: int, expanded: bool):
         async with self.condition:
-            self.capacities[pool_name] = new_total
+            self.capacity = new_total
             self.is_expanded = expanded
             self.condition.notify_all()
 
     def get_stats(self):
         return {
             "used": self.used,
-            "total": self.capacities,
+            "total": self.capacity,
             "waiting_large": self.waiting_large,
             "is_expanded": self.is_expanded,
             "is_draining": self.is_draining,
@@ -123,6 +134,10 @@ class TokenBank:
 
     async def _run_hook(self, hook: str, label: str):
         try:
+            logger.info("Executing %s hook: %s", label, hook)
             proc = await asyncio.create_subprocess_shell(hook, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            await proc.communicate()
-        except Exception: pass
+            stdout, stderr = await proc.communicate()
+            if proc.returncode != 0:
+                logger.error("%s hook failed with code %d: %s", label, proc.returncode, stderr.decode().strip())
+        except Exception as e:
+            logger.exception("Failed to trigger %s hook: %s", label, e)

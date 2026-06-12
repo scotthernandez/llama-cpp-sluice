@@ -8,3 +8,12 @@ ENV/
 *.gguf
 *.log
 .pytest_cache/
+*.tar.gz
+*.zip
+*.7z
+deployments/
+dist/
+build/
+*.egg-info/
+.idea/
+.vscode/

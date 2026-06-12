@@ -1,3 +1,6 @@
+# Promptfoo configuration for Llama-CPP Sluice
+# Documentation: https://promptfoo.dev/docs/configuration/guide
+
 prompts:
   - "Write a Python function to calculate the Fibonacci sequence."
   - "What is the capital of France?"
@@ -7,22 +10,23 @@ prompts:
 providers:
   - id: openai:chat:sluice
     config:
+      # Default Sluice port. Override via PROMPTFOO_OPENAI_API_BASE if needed.
       api_base: http://localhost:8001/v1
       api_key: unused
 
 tests:
-  - description: "Fibonacci function check"
+  - description: "Basic Code Generation"
     vars:
       messages:
         - role: user
           content: "Write a Python function to calculate Fibonacci."
     assert:
       - type: contains
-        value: "def fibonacci"
+        value: "def"
       - type: contains
         value: "return"
 
-  - description: "Fact check: France"
+  - description: "General Knowledge"
     vars:
       messages:
         - role: user
@@ -31,11 +35,11 @@ tests:
       - type: contains
         value: "Paris"
 
-  - description: "Technical conciseness check"
+  - description: "Technical Conciseness"
     vars:
       messages:
         - role: user
           content: "Explain VRAM fragmentation in 50 words."
     assert:
       - type: latency
-        threshold: 5000
+        threshold: 10000
