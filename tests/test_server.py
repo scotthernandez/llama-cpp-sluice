@@ -22,3 +22,14 @@ async def test_chat_basic():
         })
         assert response.status_code == 200
         assert response.json()["choices"][0]["message"]["content"] == "Hi"
+
+def test_embeddings():
+    client = TestClient(app)
+    with patch("sluice.server.get_tokens", return_value=[1, 2, 3]):
+        response = client.post("/v1/embeddings", json={
+            "input": "hello world"
+        })
+        assert response.status_code == 200
+        assert response.json()["object"] == "list"
+        assert len(response.json()["data"]) == 1
+        assert "embedding" in response.json()["data"][0]

@@ -9,6 +9,7 @@ mock_llama.LLAMA_SPLIT_MODE_NONE = 0
 mock_llama.LLAMA_SPLIT_MODE_ROW = 1
 mock_llama.GGML_TYPE_F16 = 1
 mock_llama.GGML_TYPE_Q4_0 = 2
+mock_llama.llama_decode.return_value = 0
 mock_internals = MagicMock()
 sys.modules['llama_cpp'] = mock_llama
 sys.modules['llama_cpp._internals'] = mock_internals

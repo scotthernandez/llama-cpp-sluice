@@ -165,6 +165,16 @@ class ChatCompletionResponse(BaseModel):
     choices: List[Dict[str, Any]]
     usage: Dict[str, int]
 
+class EmbeddingRequest(BaseModel):
+    model: str = "sluice-model"
+    input: Union[str, List[str]]
+
+class EmbeddingResponse(BaseModel):
+    object: str = "list"
+    data: List[Dict[str, Any]]
+    model: str
+    usage: Dict[str, int]
+
 async def verify_auth(auth: Optional[HTTPAuthorizationCredentials] = Depends(security)):
     if ARGS.api_key and (not auth or auth.credentials != ARGS.api_key):
         raise HTTPException(status_code=401, detail="Invalid API Key")
@@ -175,6 +185,16 @@ def get_tokens(prompt: str) -> List[int]:
     return engine.tokenize(prompt, add_bos=True, special=True)
 
 def format_prompt(messages: List[ChatMessage], tools: Optional[List[Dict[str, Any]]] = None) -> str:
+    template = engine.get_chat_template()
+    if template:
+        try:
+            from jinja2 import Template
+            msgs_list = [m.model_dump(exclude_none=True) for m in messages]
+            return Template(template).render(messages=msgs_list, tools=tools, add_generation_prompt=True)
+        except Exception as e:
+            print(f"[ERROR] Chat template rendering failed: {e}")
+
+    # Basic fallback
     p = ""
     for m in messages:
         if m.content: p += f"{m.role}: {m.content}\n"
@@ -419,6 +439,44 @@ async def chat_completions(request: ChatCompletionRequest):
             with llm_lock:
                 engine.remove_sequence(sid)
             await BANK.release(sid)
+
+@app.post("/v1/embeddings", dependencies=[Depends(verify_auth)])
+async def embeddings(request: EmbeddingRequest):
+    inputs = [request.input] if isinstance(request.input, str) else request.input
+    data = []
+    total_p = 0
+    
+    for idx, text in enumerate(inputs):
+        tokens = get_tokens(text)
+        total_p += len(tokens)
+        sid = await BANK.acquire(len(tokens))
+        try:
+            m_ptr, c_ptr = engine.get_model_ptr(), engine.get_context_ptr()
+            batch = llama_cpp.llama_batch_init(len(tokens), 0, 1)
+            try:
+                batch.n_tokens = len(tokens)
+                for i in range(len(tokens)):
+                    batch.token[i], batch.pos[i], batch.n_seq_id[i], batch.seq_id[i][0], batch.logits[i] = tokens[i], i, 1, sid, False
+                
+                with llm_lock:
+                    if llama_cpp.llama_decode(c_ptr, batch) != 0:
+                        raise RuntimeError("Embedding decode fail")
+                    vec = engine.get_embeddings(sid)
+                
+                data.append({"object": "embedding", "index": idx, "embedding": vec})
+            finally:
+                llama_cpp.llama_batch_free(batch)
+        finally:
+            with llm_lock:
+                engine.remove_sequence(sid)
+            await BANK.release(sid)
+            
+    return {
+        "object": "list",
+        "data": data,
+        "model": request.model,
+        "usage": {"prompt_tokens": total_p, "total_tokens": total_p}
+    }
 
 @app.get("/metrics", dependencies=[Depends(verify_auth)])
 async def metrics(): return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)

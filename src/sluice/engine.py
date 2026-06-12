@@ -102,6 +102,25 @@ class SluiceEngine:
             output += buf[:nb].decode('utf-8', errors='ignore')
         return output
 
+    def get_chat_template(self) -> Optional[str]:
+        """Extract tokenizer.chat_template from model metadata."""
+        buf = ctypes.create_string_buffer(8192)
+        res = llama_cpp.llama_model_meta_val_str(
+            self.model_ptr, b"tokenizer.chat_template", buf, 8192
+        )
+        if res >= 0:
+            return buf.value.decode('utf-8', errors='ignore')
+        return None
+
+    def get_embeddings(self, sid: int) -> List[float]:
+        """Extract embeddings for a specific sequence."""
+        embd_ptr = llama_cpp.llama_get_embeddings_seq(self.ctx_ptr, sid)
+        if not embd_ptr:
+            return []
+        
+        n_embd = llama_cpp.llama_n_embd(self.model_ptr)
+        return [float(embd_ptr[i]) for i in range(n_embd)]
+
     def remove_sequence(self, sid: int):
         # Use llama_memory_seq_rm for older/stable bindings
         if hasattr(llama_cpp, "llama_kv_cache_seq_rm"):
