@@ -121,6 +121,13 @@ class SluiceEngine:
         n_embd = llama_cpp.llama_n_embd(self.model_ptr)
         return [float(embd_ptr[i]) for i in range(n_embd)]
 
+    def clone_sequence(self, src_sid: int, dest_sid: int, length: int):
+        """Zero-copy clone KV data from one sequence to another."""
+        if hasattr(llama_cpp, "llama_kv_cache_seq_cp"):
+            llama_cpp.llama_kv_cache_seq_cp(self.ctx_ptr, src_sid, dest_sid, 0, length)
+        else:
+            llama_cpp.llama_memory_seq_cp(self.ctx_ptr, src_sid, dest_sid, 0, length)
+
     def remove_sequence(self, sid: int):
         # Use llama_memory_seq_rm for older/stable bindings
         if hasattr(llama_cpp, "llama_kv_cache_seq_rm"):

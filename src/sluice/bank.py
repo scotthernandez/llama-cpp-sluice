@@ -2,7 +2,7 @@ import asyncio
 import time
 import subprocess
 import logging
-from typing import Dict, Optional, List, Any
+from typing import Dict, Optional, List, Any, Callable
 
 # Configure logger
 logger = logging.getLogger("sluice.bank")
@@ -39,18 +39,20 @@ class TokenBank:
     async def acquire(self, requested_size: int, timeout: float = 60.0) -> int:
         is_large = requested_size >= self.large_threshold
         start_time = time.time()
-        hook_triggered = False
-
-        while True:
-            trigger_scavenge = False
-            sid = None
+        
+        # Track if we need to decrement waiting_large in the finally block
+        decrement_needed = is_large
+        
+        if is_large:
             async with self.condition:
-                if self.is_draining: raise RuntimeError("Server is currently draining.")
-                if is_large and not hook_triggered: # Only increment once if we loop
-                    self.waiting_large += 1
-                    hook_triggered = True # Using this to track the increment too
-                
-                try:
+                self.waiting_large += 1
+        
+        try:
+            while True:
+                trigger_scavenge = False
+                async with self.condition:
+                    if self.is_draining: raise RuntimeError("Server is currently draining.")
+                    
                     available = self.capacity - self.used
                     
                     if not is_large and (self.waiting_large > 0 or (available - requested_size) < self.reserved_for_large):
@@ -59,31 +61,37 @@ class TokenBank:
                         can_fit = requested_size <= available and len(self.available_sids) > 0
 
                     if can_fit:
-                        if is_large: self.waiting_large -= 1
+                        if is_large: 
+                            self.waiting_large -= 1
+                            decrement_needed = False
+                        
                         sid = self.available_sids.pop(0)
                         self.used += requested_size
                         self.active_seqs[sid] = requested_size
                         return sid
 
                     elapsed = time.time() - start_time
-                    if is_large and self.starvation_hook and elapsed > self.scavenge_delay and sid not in self._scavenge_triggered:
-                        self._scavenge_triggered[sid] = time.time()
+                    # Use a dummy key for hook deduplication when sid isn't known yet
+                    hook_key = -1 
+                    if is_large and self.starvation_hook and elapsed > self.scavenge_delay and hook_key not in self._scavenge_triggered:
+                        self._scavenge_triggered[hook_key] = time.time()
                         trigger_scavenge = True
 
                     if elapsed > timeout:
-                        if is_large: self.waiting_large -= 1
                         reason = "Bank saturated" if requested_size > available else "No sequence IDs available"
                         raise BankSaturated(f"{reason}: Needed {requested_size}")
                     
                     try: await asyncio.wait_for(self.condition.wait(), timeout=min(1.0, timeout - elapsed))
                     except asyncio.TimeoutError: pass
-                except Exception:
-                    if is_large: self.waiting_large -= 1
-                    raise
-            
-            # Execute hook outside of condition lock
-            if trigger_scavenge:
-                asyncio.create_task(self._run_hook(self.starvation_hook, "Scavenge"))
+                
+                # Execute hook outside of condition lock
+                if trigger_scavenge:
+                    asyncio.create_task(self._run_hook(self.starvation_hook, "Scavenge"))
+        finally:
+            if decrement_needed:
+                async with self.condition:
+                    self.waiting_large -= 1
+                    self.condition.notify_all()
 
     def get_available_for_large(self) -> int:
         return self.capacity - self.used
