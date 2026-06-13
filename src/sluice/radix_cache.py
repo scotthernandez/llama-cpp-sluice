@@ -4,135 +4,86 @@ from __future__ import annotations
 
 import threading
 from collections import OrderedDict
-from typing import Any, Optional
+from typing import Any, Optional, List, Dict
+
+
+class RadixNode:
+    """Minimal radix tree node for prefix caching."""
+    __slots__ = ("prefix", "children", "value", "is_terminal")
+
+    def __init__(self, prefix: str = "", value: Any = None, is_terminal: bool = False) -> None:
+        self.prefix = prefix
+        self.children: Dict[str, "RadixNode"] = {}
+        self.value = value # Typically (sid, tokens)
+        self.is_terminal = is_terminal
+
+    def __repr__(self) -> str:
+        return f"RadixNode(prefix={self.prefix!r}, value={self.value}, terminal={self.is_terminal})"
 
 
 class RadixCache:
-    """A thread-safe LRU cache with insertion-order tracking.
+    """Thread-safe LRU radix cache for KV-prefix deduplication."""
 
-    Designed for prefix-caching in LLM inference: keys are string prefixes,
-    values are arbitrary (e.g. token sequences or activation tensors).
-
-    Attributes
-    ----------
-    _cache : OrderedDict[str, Any]
-        The underlying key-value store.
-    _order : list[str]
-        Monotonically growing list of keys in insertion order (duplicates
-        are removed on re-insertion so _order stays a valid permutation
-        of _cache.keys()).
-    on_evict : Callable[[str, Any], None] | None
-        Optional callback triggered when an item is evicted.
-    """
-
-    def __init__(self, max_size: int = 4096, on_evict: Optional[Callable[[str, Any], None]] = None) -> None:
+    def __init__(self, max_size: int = 256, on_evict: Optional[Any] = None) -> None:
         self.max_size = max_size
-        self._cache: OrderedDict[str, Any] = OrderedDict()
-        self._order: list[str] = []
+        self._cache: Dict[str, RadixNode] = {}
+        self._order: List[str] = []  # LRU order (most-recent at end)
         self._lock = threading.Lock()
-        self._hits = 0
-        self._misses = 0
         self.on_evict = on_evict
 
-    # -- public API -------------------------------------------------------- #
-
     def put(self, key: str, value: Any) -> None:
-        """Insert or update *key* with *value*.  LRU eviction runs if full."""
+        """Insert or update a key-node pair. Evicts LRU entry when over max_size."""
         evicted_items: List[tuple[str, Any]] = []
         with self._lock:
             if key in self._cache:
-                self._cache.move_to_end(key)
-                if key in self._order:
-                    self._order.remove(key)
-                self._order.append(key)
-                self._cache[key] = value
-                return
-
-            # Evict LRU entries until we have room
+                self._order.remove(key)
+            
+            # Evict if full
             while len(self._cache) >= self.max_size and self._cache:
-                evict_key, evict_val = self._cache.popitem(last=False)
-                evicted_items.append((evict_key, evict_val))
-                try:
-                    self._order.remove(evict_key)
-                except ValueError:
-                    pass
+                evict_key = self._order.pop(0)
+                evicted_items.append((evict_key, self._cache.pop(evict_key).value))
 
-            self._cache[key] = value
+            node = RadixNode(prefix=key, value=value, is_terminal=True)
+            self._cache[key] = node
             self._order.append(key)
         
-        # Trigger callbacks outside the lock
         if self.on_evict:
             for ek, ev in evicted_items:
                 try: self.on_evict(ek, ev)
                 except Exception: pass
 
-    def get(self, key: str, default: Any = None) -> Any:
-        """Return the value for *key*, or *default* on miss."""
+    def get(self, key: str) -> Optional[Any]:
+        """Return the cached value for *key*, or ``None``."""
         with self._lock:
             if key in self._cache:
-                self._cache.move_to_end(key)
-                self._hits += 1
-                return self._cache[key]
-            self._misses += 1
-            return default
-
-    def delete(self, key: str) -> bool:
-        """Remove *key* from the cache. Returns True if it existed."""
-        with self._lock:
-            if key not in self._cache:
-                return False
-            del self._cache[key]
-            try:
                 self._order.remove(key)
-            except ValueError:
-                pass
-            return True
+                self._order.append(key)
+                return self._cache[key].value
+            return None
 
-    def clear(self) -> None:
-        """Remove all entries."""
+    def has_value(self, target_value: Any) -> bool:
+        """Thread-safe check if any node contains the specified value (e.g. SID)."""
         with self._lock:
-            self._cache.clear()
-            self._order.clear()
-
-    def keys(self) -> list[str]:
-        """Return a copy of the current keys."""
-        with self._lock:
-            return list(self._cache.keys())
-
-    def has_value(self, value: Any) -> bool:
-        """Check if any cached entry contains the specified value (thread-safe)."""
-        with self._lock:
-            # For complex values (like our tuples), we check for the specific value
-            # This is typically used to see if an SID is still in cache.
-            for v in self._cache.values():
-                if v == value: return True
-                if isinstance(v, (tuple, list)) and value in v: return True
+            for node in self._cache.values():
+                val = node.value
+                if val == target_value: return True
+                if isinstance(val, (tuple, list)) and target_value in val: return True
             return False
 
     def __len__(self) -> int:
         with self._lock:
             return len(self._cache)
 
-    def __contains__(self, key: str) -> bool:
+    def clear(self) -> None:
+        """Remove all entries."""
+        evicted_items: List[tuple[str, Any]] = []
         with self._lock:
-            return key in self._cache
-
-    # -- stats ------------------------------------------------------------- #
-
-    def stats(self) -> dict[str, Any]:
-        with self._lock:
-            total = self._hits + self._misses
-            hit_rate = self._hits / total if total else 0.0
-            return {
-                "size": len(self._cache),
-                "max_size": self.max_size,
-                "hits": self._hits,
-                "misses": self._misses,
-                "hit_rate": hit_rate,
-                "order_len": len(self._order),
-            }
-
-    def reset_stats(self) -> None:
-        with self._lock:
-            self._hits = 0
-            self._misses = 0
+            for k, node in self._cache.items():
+                evicted_items.append((k, node.value))
+            self._cache.clear()
+            self._order.clear()
+        
+        if self.on_evict:
+            for ek, ev in evicted_items:
+                try: self.on_evict(ek, ev)
+                except Exception: pass

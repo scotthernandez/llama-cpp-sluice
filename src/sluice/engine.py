@@ -2,8 +2,73 @@ import llama_cpp
 import os
 import json
 import ctypes
+import threading
 from typing import Optional, List, Dict
 from .pools import PoolConfig
+
+
+class RadixNode:
+    """Minimal radix tree node for prefix caching."""
+    __slots__ = ("prefix", "children", "seq_id", "is_terminal")
+
+    def __init__(self, prefix: str = "", seq_id: Optional[int] = None, is_terminal: bool = False) -> None:
+        self.prefix = prefix
+        self.children: Dict[str, "RadixNode"] = {}
+        self.seq_id = seq_id
+        self.is_terminal = is_terminal
+
+    def __repr__(self) -> str:
+        return f"RadixNode(prefix={self.prefix!r}, seq_id={self.seq_id}, terminal={self.is_terminal})"
+
+
+class RadixCache:
+    """Thread-safe LRU radix cache for KV-prefix deduplication.
+
+    All public methods acquire ``self._lock`` before touching ``_cache`` or
+    ``_order`` so that concurrent calls from the ``ThreadPoolExecutor`` never
+    see an inconsistent dict/list pair.
+    """
+
+    def __init__(self, max_size: int = 256) -> None:
+        self.max_size = max_size
+        self._cache: Dict[str, RadixNode] = {}
+        self._order: List[str] = []  # LRU order (most-recent at end)
+        self._lock = threading.Lock()
+
+    def insert(self, key: str, node: RadixNode) -> None:
+        """Insert or update a key-node pair.  Evicts LRU entry when over max_size."""
+        with self._lock:
+            if key in self._cache:
+                self._order.remove(key)
+            self._cache[key] = node
+            self._order.append(key)
+            if len(self._cache) > self.max_size:
+                evict_key = self._order.pop(0)
+                self._cache.pop(evict_key)
+
+    def lookup(self, key: str) -> Optional[RadixNode]:
+        """Return the cached node for *key*, or ``None``."""
+        with self._lock:
+            return self._cache.get(key)
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._cache)
+
+    def __contains__(self, key: str) -> bool:
+        with self._lock:
+            return key in self._cache
+
+    def clear(self) -> None:
+        """Remove all entries."""
+        with self._lock:
+            self._cache.clear()
+            self._order.clear()
+
+    def keys(self) -> List[str]:
+        """Return a snapshot of cached keys."""
+        with self._lock:
+            return list(self._order)
 
 class SluiceEngine:
     def __init__(self, model_path: str, pool: PoolConfig, 
@@ -50,6 +115,9 @@ class SluiceEngine:
         if not self.model_ptr:
             raise RuntimeError(f"Failed to load model: {model_path}")
         
+        # TODO(t_2c438329): Multi-context support — currently creates exactly
+        # one context pointer. See GitHub issue #12 for the proposal to manage
+        # a pool of independent contexts for concurrent inference.
         self.ctx_ptr = self._create_raw_context(pool)
         
     def _create_raw_context(self, config: PoolConfig):

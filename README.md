@@ -21,7 +21,28 @@ While optimized for multi-GPU setups (PCIe x16/x4), Sluice is **fully compatible
 - **Proxmox & Docker Native:** Optimized for unprivileged LXC containers and CUDA-accelerated Docker environments.
 - **Dynamic Auto-Elasticity:** Automatically grows the VRAM pool by scavenging resources (stopping SST/TTS) when a large request arrives, and shrinks back once idle.
 - **Tool Calling Support:** Full support for OpenAI-standard `tools` and `tool_choice` parameters.
-- **Optional Authentication:** Secure your server with a simple `SLUICE_API_KEY` Bearer Token.
+**- Optional Authentication:** Secure your server with a simple `SLUICE_API_KEY` Bearer Token.
+
+### ⚠️ Known Limitations
+
+**Single-Sequence Inference.** All inference is serialized to a single worker via a
+hardware execution lock (`llm_lock`).  While `n_seq_max` is configured to 16, the lock
+ensures that at most **one sequence generates at any given moment** — prefill plus the
+full decode loop run atomically under one lock hold.  This is by design:
+
+* **Prevents starvation** — the TokenBank's anti-starvation bank reserves VRAM for large
+  requests; without serialization a flood of tiny requests could starve them.
+* **Eliminates latency spikes** — concurrent multi-sequence decoding on the same context
+  causes KV-cache contention and non-deterministic decode ordering, which spikes latency
+  unpredictably.  Serialisation gives stable per-request latency.
+* **Avoids C-level crashes** — the underlying `llama.cpp` C API does not support true
+  concurrent multi-sequence decoding on the same context pointer.  Calling `llama_decode`
+  from multiple OS threads can trigger SIGSEGV or silent KV-cache corruption.
+
+Concurrent requests are multiplexed at the token-bank level but processed sequentially.
+For genuine parallel generation a multi-engine / multi-context deployment would be needed
+(not currently implemented).  See `src/sluice/server.py` for the full serialization
+comment and `docs/concurrency.md` for architecture details.
 
 ## 🛠️ Quick Start
 

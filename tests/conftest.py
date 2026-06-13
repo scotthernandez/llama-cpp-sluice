@@ -15,20 +15,13 @@ sys.modules['llama_cpp'] = mock_llama
 sys.modules['llama_cpp._internals'] = mock_internals
 
 # 2. Setup mock model/context classes
-class MockModel:
-    pass
-
-class MockContext:
-    def __init__(self, model, params):
-        self.model = model
-        self.params = params
-
-mock_internals.LlamaModel.return_value = MagicMock()
-mock_internals.LlamaContext.return_value = MagicMock()
+mock_model_obj = MagicMock()
+mock_ctx_obj = MagicMock()
+mock_internals.LlamaModel.return_value = mock_model_obj
+mock_internals.LlamaContext.return_value = mock_ctx_obj
 
 import pytest
 
-# 3. Handle Sluice imports gracefully
 try:
     import sluice.bank
 except ImportError:
@@ -68,23 +61,36 @@ try:
     sluice.server.engine.get_n_embd.return_value = 128
     sluice.server.engine.get_embeddings.return_value = [0.1] * 128
     sluice.server.engine.get_frag_ratio.return_value = 0.0
-except (ImportError, AttributeError):
-    # Fallback/stubs
-    pass
+except ImportError:
+    # If server can't be imported, create minimal stubs
+    if 'sluice' not in sys.modules:
+        sluice = MagicMock()
+        sys.modules['sluice'] = sluice
+    sys.modules['sluice.server'] = MagicMock()
+    sluice = sys.modules['sluice']
+    if not hasattr(sluice, 'server'):
+        sluice.server = MagicMock()
+    if not hasattr(sluice, 'bank'):
+        sluice.bank = MagicMock()
+    sluice.server.BANK = MagicMock()
+    sluice.server.BANK.used = 0
+    sluice.server.BANK.active_seqs = {}
+    sluice.server.BANK.pinned_seqs = {}
+    sluice.server.BANK.available_sids = list(range(16))
+    sluice.server.BANK.waiting_large = 0
+    sluice.server.BANK.is_draining = False
+    sluice.server.BANK.is_expanded = False
+    sluice.server.BANK.capacity = 100000
 
 @pytest.fixture(autouse=True)
 def clean_bank_fixture():
-    if hasattr(sluice.server, 'BANK'):
-        bank = sluice.server.BANK
-        bank.used = 0
-        bank.active_seqs = {}
-        bank.pinned_seqs = {}
-        bank.available_sids = list(range(16))
-        bank.waiting_large = 0
-        bank.is_draining = False
-        bank.is_expanded = False
-        bank.capacity = 100000
-        bank._scavenge_triggered = {}
-        yield bank
-    else:
-        yield None
+    bank = sluice.server.BANK
+    bank.used = 0
+    bank.active_seqs = {}
+    bank.pinned_seqs = {}
+    bank.available_sids = list(range(16))
+    bank.waiting_large = 0
+    bank.is_draining = False
+    bank.is_expanded = False
+    bank.capacity = 100000
+    yield bank

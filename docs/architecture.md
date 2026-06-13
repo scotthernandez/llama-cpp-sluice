@@ -14,6 +14,13 @@ Instead of separate contexts, Sluice uses **Sequence IDs** (`seq_id`) within the
 2. The KV cache is treated as a single "Token Reservoir."
 3. Each request is dynamically assigned a `seq_id` and a slice of the reservoir.
 
+> **Serialization note:** While up to 16 sequence IDs can be tracked simultaneously
+> (`n_seq_max=16` in engine.py), inference is **serialized to a single worker** via the
+> `llm_lock` in `server.py` (lines 69–127).  At most one sequence generates at any moment;
+> concurrent requests are processed sequentially.  This prevents starvation, eliminates
+> latency spikes from context thrashing, and avoids C-level crashes in the llama.cpp
+> runtime.  See `docs/concurrency.md` for full details.
+
 ### Radix Prefix Caching
 Sluice implements a high-performance **Radix Cache** that deduplicates VRAM for shared prefixes (like system prompts or large context files).
 - **Zero-Copy Cloning:** Uses `llama_memory_seq_cp` to instantly clone pre-filled tokens from a cached sequence to a new request.
