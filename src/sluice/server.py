@@ -70,6 +70,9 @@ TRIMMER: Optional[MiddleOutTrimmer] = None
 RADIX_CACHE: Optional[RadixCache] = None
 SHUTDOWN_EVENT = threading.Event()
 
+# Atomic lock for global engine/bank state changes (hot-reloads, cleanup)
+engine_lock = threading.Lock()
+
 # Hardware execution executor (Properly serializes C-level inference to a single background thread)
 # Inference is serialized to a single worker.  Every code path that calls
 # llama_decode / llama_sampler_sample acquires this lock before proceeding,
@@ -121,7 +124,10 @@ async def startup():
         print(f"[CACHE] Evicting prefix: {key[:32]}... (sid={sid})")
         # 1. Free C-level memory (serialized via executor)
         def c_cleanup():
-            if engine: engine.remove_sequence(sid)
+            # Use lock to check engine global
+            with engine_lock:
+                local_engine = engine
+            if local_engine: local_engine.remove_sequence(sid)
         loop.run_in_executor(llm_executor, c_cleanup)
         # 2. Release token budget in the bank
         asyncio.run_coroutine_threadsafe(BANK.evict(sid), loop)
@@ -134,26 +140,31 @@ async def startup():
     print(f"[SLUICE] Initializing Sluice Engine: {ARGS.model}")
     pool_cfg = PoolConfig(name="main", max_tokens=ARGS.ctx_size)
     
-    engine = SluiceEngine(
-        model_path=ARGS.model,
-        pool=pool_cfg,
-        mmproj_path=None,
-        tensor_split=ts_list,
-        n_batch=ARGS.batch_size,
-        n_ubatch=ARGS.ubatch_size,
-        n_gpu_layers=-1,
-        split_mode=ARGS.split_mode,
-        flash_attn=ARGS.flash_attn,
-        embeddings=True,
-        n_threads=ARGS.threads,
-        n_threads_batch=ARGS.threads_batch,
-        use_mlock=ARGS.mlock,
-        use_mmap=ARGS.mmap
-    )
+    with engine_lock:
+        engine = SluiceEngine(
+            model_path=ARGS.model,
+            pool=pool_cfg,
+            mmproj_path=None,
+            tensor_split=ts_list,
+            n_batch=ARGS.batch_size,
+            n_ubatch=ARGS.ubatch_size,
+            n_gpu_layers=-1,
+            split_mode=ARGS.split_mode,
+            flash_attn=ARGS.flash_attn,
+            embeddings=True,
+            n_threads=ARGS.threads,
+            n_threads_batch=ARGS.threads_batch,
+            use_mlock=ARGS.mlock,
+            use_mmap=ARGS.mmap
+        )
+        
+        BANK = TokenBank(ARGS.ctx_size, RESERVED_POOL, LARGE_THRESHOLD, max_sequences=128)
     
-    BANK = TokenBank(ARGS.ctx_size, RESERVED_POOL, LARGE_THRESHOLD, max_sequences=16)
-    
-    def get_tokens(text): return engine.tokenize(text, add_bos=True, special=True)
+    def get_tokens(text): 
+        with engine_lock:
+            local_engine = engine
+        if not local_engine: return []
+        return local_engine.tokenize(text, add_bos=True, special=True)
     
     def format_p(msgs, tools=None):
         p = ""
@@ -173,8 +184,11 @@ async def shutdown():
     if BANK:
         await BANK.drain()
     llm_executor.shutdown(wait=True)
-    if engine:
-        del engine
+    with engine_lock:
+        if engine:
+            del engine
+        engine = None
+        BANK = None
     print("[SLUICE] Gateway offline.")
 
 # --- OpenAI Compatibility ---
@@ -224,11 +238,11 @@ async def verify_auth(auth: Optional[HTTPAuthorizationCredentials] = Depends(sec
 
 # --- Inference Core ---
 
-def get_tokens(prompt: str) -> List[int]:
-    return engine.tokenize(prompt, add_bos=True, special=True)
+def get_tokens(prompt: str, local_engine: SluiceEngine) -> List[int]:
+    return local_engine.tokenize(prompt, add_bos=True, special=True)
 
-def format_prompt(messages: List[ChatMessage], tools: Optional[List[Dict[str, Any]]] = None) -> str:
-    template = engine.get_chat_template()
+def format_prompt(messages: List[ChatMessage], local_engine: SluiceEngine, tools: Optional[List[Dict[str, Any]]] = None) -> str:
+    template = local_engine.get_chat_template()
     if template:
         try:
             from jinja2 import Template
@@ -279,31 +293,43 @@ def check_stop_sequences(text: str, stop: Optional[Union[str, List[str]]]) -> bo
 
 @app.post("/v1/admin/drain", dependencies=[Depends(verify_auth)])
 async def admin_drain():
-    asyncio.create_task(BANK.drain())
-    return {"status": "draining"}
+    with engine_lock:
+        local_bank = BANK
+    if local_bank:
+        asyncio.create_task(local_bank.drain())
+        return {"status": "draining"}
+    return {"status": "error", "message": "Bank not initialized"}
 
 @app.post("/v1/admin/resume", dependencies=[Depends(verify_auth)])
 async def admin_resume():
-    await BANK.resume()
-    return {"status": "running"}
+    with engine_lock:
+        local_bank = BANK
+    if local_bank:
+        await local_bank.resume()
+        return {"status": "running"}
+    return {"status": "error", "message": "Bank not initialized"}
 
 @app.get("/v1/admin/stats", dependencies=[Depends(verify_auth)])
 async def admin_stats():
-    return BANK.get_stats()
+    with engine_lock:
+        local_bank = BANK
+    if local_bank:
+        return local_bank.get_stats()
+    return {"status": "error", "message": "Bank not initialized"}
 
 @app.get("/v1/models", dependencies=[Depends(verify_auth)])
 async def list_models():
     return {"object": "list", "data": [{"id": ARGS.alias, "object": "model", "created": int(time.time()), "owned_by": "sluice"}]}
 
-def low_level_generate(sid: int, tokens: List[int], max_tokens: int, budget: int, request: ChatCompletionRequest, src_sid: Optional[int] = None, prefix_len: int = 0):
-    m_ptr, c_ptr = engine.get_model_ptr(), engine.get_context_ptr()
+def low_level_generate(local_engine: SluiceEngine, sid: int, tokens: List[int], max_tokens: int, budget: int, request: ChatCompletionRequest, src_sid: Optional[int] = None, prefix_len: int = 0):
+    m_ptr, c_ptr = local_engine.get_model_ptr(), local_engine.get_context_ptr()
     n_tokens = len(tokens)
     batch = llama_cpp.llama_batch_init(ARGS.batch_size, 0, 1)
     try:
         start_idx = 0
         if src_sid is not None and prefix_len > 0:
             print(f"[CACHE] Cloning {prefix_len} tokens from sid {src_sid} to sid {sid}")
-            engine.clone_sequence(src_sid, sid, prefix_len)
+            local_engine.clone_sequence(src_sid, sid, prefix_len)
             start_idx = prefix_len
 
         # Decode prompt (skipping cached prefix)
@@ -352,15 +378,15 @@ def low_level_generate(sid: int, tokens: List[int], max_tokens: int, budget: int
         return output_text, n_tokens, (n_cur - n_tokens), finish_reason
     finally: llama_cpp.llama_batch_free(batch)
 
-def low_level_stream_start(sid: int, tokens: List[int], request: ChatCompletionRequest, src_sid: Optional[int] = None, prefix_len: int = 0):
-    m_ptr, c_ptr = engine.get_model_ptr(), engine.get_context_ptr()
+def low_level_stream_start(local_engine: SluiceEngine, sid: int, tokens: List[int], request: ChatCompletionRequest, src_sid: Optional[int] = None, prefix_len: int = 0):
+    m_ptr, c_ptr = local_engine.get_model_ptr(), local_engine.get_context_ptr()
     n_tokens = len(tokens)
     batch = llama_cpp.llama_batch_init(ARGS.batch_size, 0, 1)
     try:
         start_idx = 0
         if src_sid is not None and prefix_len > 0:
             print(f"[CACHE] Cloning {prefix_len} tokens from sid {src_sid} to sid {sid}")
-            engine.clone_sequence(src_sid, sid, prefix_len)
+            local_engine.clone_sequence(src_sid, sid, prefix_len)
             start_idx = prefix_len
 
         # Decode prompt (skipping cached prefix)
@@ -383,9 +409,9 @@ def low_level_stream_start(sid: int, tokens: List[int], request: ChatCompletionR
     finally: llama_cpp.llama_batch_free(batch)
     return n_tokens, ntid
 
-def low_level_stream_step(sid: int, n_cur: int, last_tokens: List[int], request: ChatCompletionRequest, budget: int, prev_ntid: int):
+def low_level_stream_step(local_engine: SluiceEngine, sid: int, n_cur: int, last_tokens: List[int], request: ChatCompletionRequest, budget: int, prev_ntid: int):
     if SHUTDOWN_EVENT.is_set(): return None, None, "shutdown"
-    m_ptr, c_ptr = engine.get_model_ptr(), engine.get_context_ptr()
+    m_ptr, c_ptr = local_engine.get_model_ptr(), local_engine.get_context_ptr()
     if (n_cur + 1) >= budget: return None, None, "length"
     
     if prev_ntid == llama_cpp.llama_token_eos(m_ptr): return None, prev_ntid, "stop"
@@ -407,6 +433,16 @@ def low_level_stream_step(sid: int, n_cur: int, last_tokens: List[int], request:
 
 @app.post("/v1/chat/completions", dependencies=[Depends(verify_auth)])
 async def chat_completions(request: ChatCompletionRequest):
+    # Snapshot globals for request duration to ensure consistency
+    with engine_lock:
+        local_engine = engine
+        local_bank = BANK
+        local_trimmer = TRIMMER
+        local_cache = RADIX_CACHE
+    
+    if not local_engine or not local_bank:
+        raise HTTPException(status_code=503, detail="Engine not initialized")
+
     rid = f"sluice-{uuid.uuid4().hex[:8]}"
     
     # 1. Identity prefix for caching (first system message)
@@ -416,32 +452,32 @@ async def chat_completions(request: ChatCompletionRequest):
 
     src_sid = None
     prefix_tokens = []
-    if cache_key and RADIX_CACHE:
-        cached_val = RADIX_CACHE.get(cache_key)
+    if cache_key and local_cache:
+        cached_val = local_cache.get(cache_key)
         if cached_val:
             src_sid, prefix_tokens = cached_val
             print(f"[CACHE] Hit! prefix_len={len(prefix_tokens)}")
 
-    prompt = format_prompt(request.messages, request.tools)
-    tokens = get_tokens(prompt)
+    prompt = format_prompt(request.messages, local_engine, request.tools)
+    tokens = get_tokens(prompt, local_engine)
     
     prompt_len = len(tokens)
     needed = prompt_len + request.max_tokens
     
     active_messages = request.messages
-    if ARGS.trimming and needed > BANK.get_available_for_large():
-        available = BANK.get_available_for_large()
+    if ARGS.trimming and needed > local_bank.get_available_for_large():
+        available = local_bank.get_available_for_large()
         if available >= 4096:
-            active_messages = TRIMMER.trim(request.messages, available - request.max_tokens, tools=request.tools)
-            prompt = format_prompt(active_messages, request.tools)
-            tokens = get_tokens(prompt)
+            active_messages = local_trimmer.trim(request.messages, available - request.max_tokens, tools=request.tools)
+            prompt = format_prompt(active_messages, local_engine, request.tools)
+            tokens = get_tokens(prompt, local_engine)
             needed = len(tokens) + request.max_tokens
         else:
             return Response(json.dumps({"error": {"message": f"VRAM Full. Need {needed}, avail {available}"}}), status_code=429, headers={"Retry-After": "5"})
 
     sid = None
     try:
-        sid = await BANK.acquire(needed)
+        sid = await local_bank.acquire(needed)
         
         # If we had a cache hit, ensure the prefix tokens match the start of our current prompt
         actual_prefix_len = 0
@@ -457,13 +493,31 @@ async def chat_completions(request: ChatCompletionRequest):
                     loop = asyncio.get_event_loop()
                     
                     def start():
-                        return low_level_stream_start(sid, tokens, request, src_sid=src_sid, prefix_len=actual_prefix_len)
+                        return low_level_stream_start(local_engine, sid, tokens, request, src_sid=src_sid, prefix_len=actual_prefix_len)
                             
                     n_cur, prev_ntid = await loop.run_in_executor(llm_executor, start)
                     
+                    # 2. Populate cache on miss (using a cloned sequence to keep it "frozen")
+                    if cache_key and src_sid is None and local_cache:
+                        sys_prompt = format_prompt(request.messages[:1], local_engine)
+                        sys_tokens = get_tokens(sys_prompt, local_engine)
+                        if sys_tokens:
+                            # We clone the prefilled state into a new "static" sequence for the cache
+                            cache_sid = await local_bank.acquire(len(sys_tokens), timeout=5.0)
+                            try:
+                                def clone():
+                                    local_engine.clone_sequence(sid, cache_sid, len(sys_tokens))
+                                await loop.run_in_executor(llm_executor, clone)
+                                local_cache.put(cache_key, (cache_sid, sys_tokens))
+                                await local_bank.release(cache_sid, pin=True)
+                                print(f"[CACHE] Prefilled prefix cached on sid {cache_sid}")
+                            except Exception as ce:
+                                print(f"[CACHE] Failed to clone for cache: {ce}")
+                                await local_bank.release(cache_sid)
+
                     for _ in range(request.max_tokens):
                         def step():
-                            return low_level_stream_step(sid, n_cur, last_tokens, request, needed, prev_ntid)
+                            return low_level_stream_step(local_engine, sid, n_cur, last_tokens, request, needed, prev_ntid)
                         
                         piece, ntid, finish = await loop.run_in_executor(llm_executor, step)
                         
@@ -476,46 +530,46 @@ async def chat_completions(request: ChatCompletionRequest):
                         yield f"data: {json.dumps({'id': rid, 'choices': [{'index': 0, 'delta': {'content': piece}, 'finish_reason': None}], 'model': ARGS.alias})}\n\n"
                         n_cur += 1
                     yield "data: [DONE]\n\n"
-                    
-                    # 2. Populate cache on miss
-                    if cache_key and src_sid is None and RADIX_CACHE:
-                        # Find where the system prompt ends in tokens
-                        sys_prompt = format_prompt(request.messages[:1])
-                        sys_tokens = get_tokens(sys_prompt)
-                        if sys_tokens:
-                            print(f"[CACHE] Populating cache for sid {sid}")
-                            RADIX_CACHE.put(cache_key, (sid, sys_tokens))
                 except Exception as stream_e:
                     print(f"[STREAM ERROR] {stream_e}")
                     yield f"data: {json.dumps({'error': str(stream_e)})}\n\n"
                 finally:
                     if sid is not None:
                         # Only cleanup and release if NOT in cache
-                        is_cached = RADIX_CACHE and RADIX_CACHE.has_value(sid)
+                        is_cached = local_cache and local_cache.has_value(sid)
                         if not is_cached:
                             def cleanup():
-                                engine.remove_sequence(sid)
+                                local_engine.remove_sequence(sid)
                             await asyncio.get_event_loop().run_in_executor(llm_executor, cleanup)
-                            await BANK.release(sid)
+                            await local_bank.release(sid)
                         else:
                             # Pin it in the bank
-                            await BANK.release(sid, pin=True)
+                            await local_bank.release(sid, pin=True)
 
             return StreamingResponse(stream_gen(), media_type="text/event-stream")
 
         loop = asyncio.get_event_loop()
         def run():
-            return low_level_generate(sid, tokens, request.max_tokens, needed, request, src_sid=src_sid, prefix_len=actual_prefix_len)
+            return low_level_generate(local_engine, sid, tokens, request.max_tokens, needed, request, src_sid=src_sid, prefix_len=actual_prefix_len)
 
         text, n_p, n_g, f_r = await loop.run_in_executor(llm_executor, run)
         
-        # Populate cache on miss
-        if cache_key and src_sid is None and RADIX_CACHE:
-            sys_prompt = format_prompt(request.messages[:1])
-            sys_tokens = get_tokens(sys_prompt)
+        # 2. Populate cache on miss (non-streaming)
+        if cache_key and src_sid is None and local_cache:
+            sys_prompt = format_prompt(request.messages[:1], local_engine)
+            sys_tokens = get_tokens(sys_prompt, local_engine)
             if sys_tokens:
-                print(f"[CACHE] Populating cache for sid {sid}")
-                RADIX_CACHE.put(cache_key, (sid, sys_tokens))
+                cache_sid = await local_bank.acquire(len(sys_tokens), timeout=5.0)
+                try:
+                    def clone():
+                        local_engine.clone_sequence(sid, cache_sid, len(sys_tokens))
+                    await loop.run_in_executor(llm_executor, clone)
+                    local_cache.put(cache_key, (cache_sid, sys_tokens))
+                    await local_bank.release(cache_sid, pin=True)
+                    print(f"[CACHE] Prefilled prefix cached on sid {cache_sid}")
+                except Exception as ce:
+                    print(f"[CACHE] Failed to clone for cache: {ce}")
+                    await local_bank.release(cache_sid)
 
         return {
             "id": rid,
@@ -532,28 +586,36 @@ async def chat_completions(request: ChatCompletionRequest):
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         if sid is not None and not request.stream:
-            is_cached = RADIX_CACHE and RADIX_CACHE.has_value(sid)
+            is_cached = local_cache and local_cache.has_value(sid)
             if not is_cached:
                 def cleanup():
-                    engine.remove_sequence(sid)
+                    local_engine.remove_sequence(sid)
                 await asyncio.get_event_loop().run_in_executor(llm_executor, cleanup)
-                await BANK.release(sid)
+                await local_bank.release(sid)
             else:
-                await BANK.release(sid, pin=True)
+                await local_bank.release(sid, pin=True)
 
 @app.post("/v1/embeddings", dependencies=[Depends(verify_auth)])
 async def embeddings(request: EmbeddingRequest):
+    # Snapshot globals
+    with engine_lock:
+        local_engine = engine
+        local_bank = BANK
+    
+    if not local_engine or not local_bank:
+        raise HTTPException(status_code=503, detail="Engine not initialized")
+
     inputs = [request.input] if isinstance(request.input, str) else request.input
     data = []
     total_p = 0
     
     for idx, text in enumerate(inputs):
-        tokens = get_tokens(text)
+        tokens = get_tokens(text, local_engine)
         total_p += len(tokens)
         sid = None
         try:
-            sid = await BANK.acquire(len(tokens))
-            m_ptr, c_ptr = engine.get_model_ptr(), engine.get_context_ptr()
+            sid = await local_bank.acquire(len(tokens))
+            m_ptr, c_ptr = local_engine.get_model_ptr(), local_engine.get_context_ptr()
             batch = llama_cpp.llama_batch_init(len(tokens), 0, 1)
             try:
                 batch.n_tokens = len(tokens)
@@ -563,7 +625,7 @@ async def embeddings(request: EmbeddingRequest):
                 def decode():
                     if llama_cpp.llama_decode(c_ptr, batch) != 0:
                         raise RuntimeError("Embedding decode fail")
-                    return engine.get_embeddings(sid)
+                    return local_engine.get_embeddings(sid)
                 
                 vec = await asyncio.get_event_loop().run_in_executor(llm_executor, decode)
                 data.append({"object": "embedding", "index": idx, "embedding": vec})
@@ -572,9 +634,9 @@ async def embeddings(request: EmbeddingRequest):
         finally:
             if sid is not None:
                 def cleanup():
-                    engine.remove_sequence(sid)
+                    local_engine.remove_sequence(sid)
                 await asyncio.get_event_loop().run_in_executor(llm_executor, cleanup)
-                await BANK.release(sid)
+                await local_bank.release(sid)
             
     return {
         "object": "list",

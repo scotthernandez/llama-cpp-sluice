@@ -57,7 +57,7 @@ class SluiceEngine:
         cparams.n_ctx = config.max_tokens
         cparams.n_batch = self.n_batch
         cparams.n_ubatch = self.n_ubatch
-        cparams.n_seq_max = 16 # Support up to 16 concurrent sequences
+        cparams.n_seq_max = 128 # Support up to 128 concurrent/cached sequences
         cparams.n_threads = self.n_threads
         cparams.n_threads_batch = self.n_threads_batch
         cparams.type_k = config.type_k
